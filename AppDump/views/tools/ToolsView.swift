@@ -50,10 +50,20 @@ struct ToolsView: View {
                     } label: {
                         Label("修复写权限", systemImage: "folder.badge.gearshape")
                     }
+                    NavigationLink {
+                        DowngradeView()
+                    } label: {
+                        Label("应用降级", systemImage: "clock.arrow.circlepath")
+                    }
+                    NavigationLink {
+                        BlockUpdatesView()
+                    } label: {
+                        Label("阻止更新", systemImage: "hand.raised.fill")
+                    }
                 } header: {
                     HeaderLabel(text: "系统", icon: "gearshape.2")
                 } footer: {
-                    Text("进程管理读取内核进程链表列出全部进程，可修改内存或结束指定进程（系统进程可能导致注销）。修复写权限在内核里把容器文件的 apfs_fsnode 属主改写为 501:501，让写入不再被 UNIX 属主检查拦住。")
+                    Text("进程管理读取内核进程链表列出全部进程，可修改内存或结束指定进程（系统进程可能导致注销）。修复写权限在内核里把容器文件的 apfs_fsnode 属主改写为 501:501，让写入不再被 UNIX 属主检查拦住。应用降级通过 StoreKit 私有接口向 App Store 请求下载历史版本。阻止更新通过在应用目录写入 MobileInstallation 的 placeholder 标记，让指定应用不再自动更新。")
                 }
 
                 // ---------- 去除设备限制 ----------

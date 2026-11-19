@@ -14,6 +14,8 @@
 #import "vfs.h"
 #import "sbx.h"
 #import "decrypt.h"
+#import "kcdowngrade.h"
+#import "kcblock.h"
 #import "AppDumpKernelLock.h"
 #import "MemoryEditor.h"
 
