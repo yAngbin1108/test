@@ -234,9 +234,14 @@ struct santanderdirview: View {
             syncsettings()
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        .onReceive(model.$allitems) { items in
+        .onChange(of: model.allitems.count) { count in
             if nav.currentpath == item.path {
-                nav.itemcount = items.count
+                nav.itemcount = count
+            }
+        }
+        .onAppear {
+            if nav.currentpath == item.path {
+                nav.itemcount = model.allitems.count
             }
         }
         .toolbar {
