@@ -121,6 +121,7 @@ struct santanderdirview: View {
     @State private var shownewfolder = false
     @State private var shownewfile = false
     @State private var showvfsinfo = false
+    @State private var showtabname = false
 
     init(item: santanderitem, readsbx: Bool, writevfs: Bool) {
         self.item = item
@@ -148,7 +149,7 @@ struct santanderdirview: View {
                 Section {
                     ForEach(model.shownitems) { entry in
                         Button {
-                            nav.stack.append(entry)
+                            nav.push(entry)
                         } label: {
                             row(entry: entry)
                         }
@@ -212,7 +213,8 @@ struct santanderdirview: View {
                 }
             }
         }
-        .navigationTitle(item.path == "/" ? "/" : item.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
         .scrollContentBackground(.hidden)
         .toolbarBackground(.hidden, for: .navigationBar)
         .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always))
@@ -232,16 +234,35 @@ struct santanderdirview: View {
             syncsettings()
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+        .onReceive(model.$allitems) { items in
+            if nav.currentpath == item.path {
+                nav.itemcount = items.count
+            }
+        }
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if !readsbx {
-                    Button {
-                        showvfsinfo = true
-                    } label: {
-                        Image(systemName: "info.circle")
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    nav.up()
+                } label: {
+                    HStack(spacing: 2) {
+                        Image(systemName: "chevron.left")
+                            .font(.caption.weight(.semibold))
+                        Text("上一级")
                     }
                 }
+                .disabled(nav.currentpath == "/")
+            }
 
+            ToolbarItem(placement: .principal) {
+                Text(nav.currentpath)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .minimumScaleFactor(0.65)
+                    .textSelection(.enabled)
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
                         if readsbx {
@@ -272,6 +293,48 @@ struct santanderdirview: View {
                     } label: {
                         Label("新建文件", systemImage: "doc.badge.plus")
                     }
+
+                    Divider()
+
+                    Button {
+                        nav.go(santanderitem(path: "/var", isdir: true))
+                    } label: {
+                        Label("跳转到 /var", systemImage: "arrow.turn.down.right")
+                    }
+
+                    Button {
+                        nav.go(santanderitem(path: (NSHomeDirectory() as NSString).appendingPathComponent("Documents"), isdir: true))
+                    } label: {
+                        Label("App 沙盒 (Documents)", systemImage: "doc.text")
+                    }
+
+                    Button {
+                        nav.go(santanderitem(path: NSHomeDirectory(), isdir: true))
+                    } label: {
+                        Label("App 容器根目录", systemImage: "shippingbox")
+                    }
+
+                    Button {
+                        nav.go(santanderitem(path: "/", isdir: true))
+                    } label: {
+                        Label("回到根目录", systemImage: "externaldrive")
+                    }
+
+                    Divider()
+
+                    Button {
+                        nav.newtab(path: nav.currentpath)
+                    } label: {
+                        Label("用当前路径新建标签", systemImage: "plus.rectangle.on.rectangle")
+                    }
+
+                    Button {
+                        showtabname = true
+                    } label: {
+                        Label("路径标签…", systemImage: "tag")
+                    }
+
+                    Divider()
 
                     Button {
                         paste(replace: false)
@@ -307,19 +370,21 @@ struct santanderdirview: View {
                         Label(model.showhidden ? "隐藏隐藏文件" : "显示隐藏文件", systemImage: "eye")
                     }
 
-                    Button {
-                        nav.go(santanderitem(path: "/", isdir: true))
-                    } label: {
-                        Label("回到根目录", systemImage: "externaldrive")
+                    if !readsbx {
+                        Button {
+                            showvfsinfo = true
+                        } label: {
+                            Label("文件管理器信息", systemImage: "info.circle")
+                        }
                     }
 
                     Button {
-                        nav.go(santanderitem(path: NSHomeDirectory(), isdir: true))
+                        model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
                     } label: {
-                        Label("回到主目录", systemImage: "house")
+                        Label("刷新", systemImage: "arrow.clockwise")
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "plus")
                 }
             }
         }
@@ -393,6 +458,16 @@ struct santanderdirview: View {
         .sheet(isPresented: $shownewfile) {
             santandernewfilesheet(itemname: item.name) { name, text in
                 newfile(name: name, text: text)
+            }
+        }
+        .sheet(isPresented: $showtabname) {
+            santandernamesheet(
+                title: "路径标签",
+                itemname: nav.currentpath,
+                placeholder: item.name.isEmpty ? "新标签" : item.name,
+                actiontitle: "新建标签"
+            ) { name in
+                nav.newtab(path: nav.currentpath, title: name)
             }
         }
     }
