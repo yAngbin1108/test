@@ -41,14 +41,33 @@ enum vfsfs {
 
     /// 用 VFS 读一个 plist（不需要沙箱逃逸）
     static func readdict(_ path: String, maxSize: Int = 8 * 1024 * 1024) -> NSDictionary? {
-        guard AppDumpmgr.shared.vfsready else { return nil }
-        guard let data = AppDumpmgr.shared.vfsread(path: path, maxSize: maxSize), !data.isEmpty else { return nil }
-        return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? NSDictionary
+        // VFS 对未进 namecache 的路径会失败（日志 "'containers' not in ncache"），
+        // 而沙盒逃逸后 FileManager 能正常读。只走 VFS 会让整列应用「无 plist」而消失。
+        // 沙盒已逃逸时先用 POSIX 读，避免 VFS 的 namecache 遍历。
+        if AppDumpmgr.shared.sbxready,
+           let d = NSDictionary(contentsOfFile: path) { return d }
+        if AppDumpmgr.shared.vfsready,
+           let data = AppDumpmgr.shared.vfsread(path: path, maxSize: maxSize), !data.isEmpty,
+           let d = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? NSDictionary {
+            return d
+        }
+        guard AppDumpmgr.shared.sbxready || AppDumpmgr.shared.vfsready else { return nil }
+
+        // 回退一：FileManager 直读
+        if let d = NSDictionary(contentsOfFile: path) { return d }
+
+        // 回退二：FileManager 取 Data 再解析（有些二进制 plist contentsOfFile 读不了）
+        if let data = FileManager.default.contents(atPath: path), !data.isEmpty,
+           let d = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? NSDictionary {
+            return d
+        }
+        return nil
     }
 
     static func readexists(_ path: String) -> Bool {
-        guard AppDumpmgr.shared.vfsready else { return false }
-        return AppDumpmgr.shared.vfssize(path: path) > 0
+        if AppDumpmgr.shared.vfsready, AppDumpmgr.shared.vfssize(path: path) > 0 { return true }
+        guard AppDumpmgr.shared.sbxready || AppDumpmgr.shared.vfsready else { return false }
+        return FileManager.default.fileExists(atPath: path)
     }
 
     // MARK: - Mach-O cryptid（为了不走 POSIX 也能判断有没有加密）
@@ -125,8 +144,13 @@ enum vfsfs {
         for base in names.reversed() {
             for suffix in ["@3x.png", "@2x.png", ".png", ""] {
                 let p = appdir + "/" + base + suffix
-                if let data = AppDumpmgr.shared.vfsread(path: p, maxSize: 4 * 1024 * 1024),
+                // VFS 优先，失败回退 FileManager（沙盒逃逸后可用）
+                if AppDumpmgr.shared.vfsready,
+                   let data = AppDumpmgr.shared.vfsread(path: p, maxSize: 4 * 1024 * 1024),
                    let img = UIImage(data: data) {
+                    return img
+                }
+                if let d = FileManager.default.contents(atPath: p), let img = UIImage(data: d) {
                     return img
                 }
             }
@@ -136,20 +160,44 @@ enum vfsfs {
 
     /// 列出 /private/var/containers/Bundle/Application 下的全部 .app
     static func listappbundles() -> [bundleapp] {
-        guard AppDumpmgr.shared.vfsready else { return [] }
+        // 用 listdir()（VFS 失败会回退 FileManager，并对 namecache 做预热）。
+        // 之前直接调用 vfslistdir：当 vfsready 为真但该路径尚未进入 namecache 时
+        // 会返回 nil（日志 "vfs_listdir resolvepath failed ... dvn=0x0"，
+        // 或 "'containers' not in ncache"），导致应用列表整列为空 ——
+        // 解密页之所以正常，是因为它在沙盒逃逸后走的是 FileManager 直读。
+        let vfsok = AppDumpmgr.shared.vfsready
+        let sbxok = AppDumpmgr.shared.sbxready
+        log("listappbundles 开始 vfs=\(vfsok) sbx=\(sbxok)")
+        guard vfsok || sbxok else {
+            log("listappbundles 中止：VFS 与 SBX 均未就绪")
+            return []
+        }
         let root = "/private/var/containers/Bundle/Application"
-        guard let containers = AppDumpmgr.shared.vfslistdir(path: root) else {
+        guard let containers = listdir(root) else {
             log("listdir failed: \(root)")
             return []
         }
+        log("根目录容器数：\(containers.count)")
 
         var out: [bundleapp] = []
+        var subnil = 0, noapp = 0, noplist = 0
+        var firsterr = ""
         for c in containers where c.isDir {
             let cpath = root + "/" + c.name
-            guard let contents = AppDumpmgr.shared.vfslistdir(path: cpath) else { continue }
+            guard let contents = listdir(cpath) else {
+                subnil += 1
+                if firsterr.isEmpty { firsterr = "listdir nil: \(cpath)" }
+                continue
+            }
+            var foundapp = false
             for item in contents where item.name.hasSuffix(".app") {
+                foundapp = true
                 let appdir = cpath + "/" + item.name
-                guard let info = readdict(appdir + "/Info.plist") else { continue }
+                guard let info = readdict(appdir + "/Info.plist") else {
+                    noplist += 1
+                    if firsterr.isEmpty { firsterr = "no plist: \(appdir)" }
+                    continue
+                }
                 let ex = info["CFBundleExecutable"] as? String ?? ""
                 if ex.isEmpty { continue }
                 let bid = info["CFBundleIdentifier"] as? String ?? ""
@@ -160,8 +208,17 @@ enum vfsfs {
                                      path: appdir, icon: loadicon(appdir: appdir, info: info)))
                 break
             }
+            if !foundapp {
+                noapp += 1
+                if firsterr.isEmpty {
+                    let sample = contents.prefix(4).map { $0.name }.joined(separator: ",")
+                    firsterr = "no .app in \(cpath) (\(contents.count) items: \(sample))"
+                }
+            }
         }
-        log("listed \(out.count) app bundles via VFS")
+        log("listappbundles 统计：容器=\(containers.count) 读不到=\(subnil) 无app=\(noapp) 无plist=\(noplist) 结果=\(out.count)")
+        if !firsterr.isEmpty { log("首个异常：\(firsterr)") }
+        log("listed \(out.count) app bundles")
         return out
     }
 
@@ -174,7 +231,11 @@ enum vfsfs {
     /// ncache），此时即使 vfsready == true 也必须回退到 FileManager —— 沙盒逃逸
     /// 成功后那条路是通的。
     private static func listdir(_ path: String) -> [(name: String, isDir: Bool)]? {
-        if AppDumpmgr.shared.vfsready, let via = AppDumpmgr.shared.vfslistdir(path: path) {
+        // VFS 对未进 namecache 的路径不一定返回 nil —— 实测会返回【空数组】，
+        // 于是「有值就 return」会直接吞掉后续的 FileManager 回退，
+        // 表现为「容器=138 读不到=0 无app=138」。所以只有【非空】才采信。
+        if AppDumpmgr.shared.vfsready,
+           let via = AppDumpmgr.shared.vfslistdir(path: path), !via.isEmpty {
             return via
         }
         guard AppDumpmgr.shared.sbxready || AppDumpmgr.shared.vfsready else { return nil }
@@ -184,18 +245,28 @@ enum vfsfs {
             var out: [(name: String, isDir: Bool)] = []
             out.reserveCapacity(names.count)
             for n in names {
-                var isDir: ObjCBool = false
-                _ = FileManager.default.fileExists(atPath: path + "/" + n, isDirectory: &isDir)
-                out.append((n, isDir.boolValue))
+                // 不能用 fileExists(atPath:isDirectory:)：沙盒受限时它对子路径
+                // 不报错、直接返回 false，会让所有容器目录被标成「非目录」，
+                // 外层 `where c.isDir` 一次都不执行（PDF 里踩过的同一个坑）。
+                // 用 resourceValues 判定，读不到时默认按目录处理（当作文件也安全：
+                // 读 Info.plist 必然失败，会被跳过）。
+                let child = path + "/" + n
+                var isDir = true
+                if let v = try? URL(fileURLWithPath: child)
+                    .resourceValues(forKeys: [.isDirectoryKey]).isDirectory {
+                    isDir = v
+                }
+                out.append((n, isDir))
             }
             return out
         }
 
         // 回退二：先让内核把这条路径读进 namecache，再重试 VFS 列表
         if AppDumpmgr.shared.vfsready, warmnamecache(path),
-           let again = AppDumpmgr.shared.vfslistdir(path: path) {
+           let again = AppDumpmgr.shared.vfslistdir(path: path), !again.isEmpty {
             return again
         }
+        log("listdir 全部失败：\(path)")
         return nil
     }
 
