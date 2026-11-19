@@ -434,6 +434,7 @@ enum FPMachO {
     struct Slice {
         let sliceOffset: UInt64
         let cputype: UInt32
+        let cpusubtype: UInt32
         let cryptoff: UInt64
         let cryptsize: UInt64
         let cryptid: UInt32
@@ -453,6 +454,7 @@ enum FPMachO {
         let header = try read(base, 32)
         guard header.count >= 32, fpLE32(header, 0) == magic64 else { return nil }
         let cputype = fpLE32(header, 4)
+        let cpusubtype = fpLE32(header, 8)
         let ncmds = fpLE32(header, 16)
         let sizeofcmds = fpLE32(header, 20)
         guard sizeofcmds > 0, sizeofcmds < 16 * 1024 * 1024, UInt64(sizeofcmds) <= limit else { return nil }
@@ -482,6 +484,7 @@ enum FPMachO {
         guard let result = found else { return nil }
         return Slice(sliceOffset: base,
                      cputype: cputype,
+                     cpusubtype: cpusubtype,
                      cryptoff: UInt64(result.cryptoff),
                      cryptsize: UInt64(result.cryptsize),
                      cryptid: result.cryptid)
@@ -1008,6 +1011,7 @@ enum FPDecryptor {
         log("Payload：\(bundleName)")
 
         return try finish(work: work, stem: stem, staging: stageLabel, started: started,
+                          originalAppDir: nil,
                           isCancelled: isCancelled, progress: progress, log: log)
     }
 
@@ -1048,6 +1052,7 @@ enum FPDecryptor {
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "\t", with: "")
         return try finish(work: work, stem: stem, staging: stageLabel, started: started,
+                          originalAppDir: URL(fileURLWithPath: bundlePath),
                           isCancelled: isCancelled, progress: progress, log: log)
     }
 
@@ -1057,6 +1062,7 @@ enum FPDecryptor {
                                stem: String,
                                staging: String,
                                started: Date,
+                               originalAppDir: URL?,
                                isCancelled: () -> Bool,
                                progress: (String, Double, String) -> Void,
                                log: @escaping (String) -> Void) throws -> Outcome {
@@ -1095,19 +1101,32 @@ enum FPDecryptor {
                 log("路径无效，跳过：\(row.path)")
                 continue
             }
+            // cryptid 非 0 但 cryptsize 为 0：内核也认为没有需要解密的页，
+            // 当作明文处理，不要白试四轮再报错。
+            if (row.slices.first(where: { $0.cryptid != 0 })?.cryptsize ?? 0) == 0 {
+                plain += 1
+                log("跳过（没有加密区间）：\(row.path)")
+                continue
+            }
+
             progress("正在解密", 0.06 + 0.74 * Double(index) / Double(total),
                      "\(index + 1)/\(encryptedFiles.count) · \(row.path)")
+
+            log(sliceSummary(row: row, appDir: appDir))
 
             let sink = FPLogSink { line in
                 log(line.trimmingCharacters(in: .whitespaces))
             }
-            let status: Int32 = withExtendedLifetime(sink) {
-                let context = Unmanaged.passUnretained(sink).toOpaque()
-                return url.path.withCString { input in
-                    url.path.withCString { output in
-                        fp_decrypt_file(input, output, fpCoreLogTrampoline, context)
-                    }
-                }
+            var status = callCore(url.path, url.path, sink)
+
+            // 拷贝出来的副本 fairplayd 有时不认（"Cannot allocate memory"）。
+            // 已安装应用时直接映射原始安装路径再解一次：fairplayd 读得到别的
+            // App 的安装包，明文照样写进我们自己的副本。
+            if status != 0, status != 1, let originalRoot = originalAppDir,
+               let originalPath = FPPaths.join(originalRoot, row.path)?.path,
+               manager.fileExists(atPath: originalPath) {
+                log("改用原始安装路径重试：\(row.path)")
+                status = callCore(url.path, originalPath, sink)
             }
 
             switch status {
@@ -1188,6 +1207,48 @@ enum FPDecryptor {
                        clean: clean, verifySummary: verifySummary, staging: staging)
     }
 
+    /// 调 C 核心；mapPath 与写入路径相同时走普通版本。
+    private static func callCore(_ inPath: String, _ mapPath: String, _ sink: FPLogSink) -> Int32 {
+        withExtendedLifetime(sink) {
+            let context = Unmanaged.passUnretained(sink).toOpaque()
+            return inPath.withCString { input in
+                inPath.withCString { output in
+                    if mapPath == inPath {
+                        return fp_decrypt_file(input, output, fpCoreLogTrampoline, context)
+                    }
+                    return mapPath.withCString { mapped in
+                        fp_decrypt_file_ex(input, mapped, output, fpCoreLogTrampoline, context)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 每个加密切片一行诊断：内核参数、CPU 类型、旁边的 SC_Info 是否存在。
+    /// 失败时这些数字就是唯一能定位问题的线索。
+    private static func sliceSummary(row: (path: String, slices: [FPMachO.Slice]), appDir: URL) -> String {
+        guard let slice = row.slices.first(where: { $0.cryptid != 0 }) else { return row.path }
+        let name = (row.path as NSString).lastPathComponent
+        let parent = (row.path as NSString).deletingLastPathComponent
+        let sinfRelative = parent.isEmpty
+            ? "SC_Info/\(name).sinf"
+            : "\(parent)/SC_Info/\(name).sinf"
+        var sinfText = "缺失"
+        if let sinf = FPPaths.join(appDir, sinfRelative),
+           let attrs = try? FileManager.default.attributesOfItem(atPath: sinf.path),
+           let size = attrs[.size] as? NSNumber {
+            sinfText = "\(size.intValue) B"
+        }
+        return String(format: "%@ · cpu=0x%x/0x%x cryptoff=0x%llx cryptsize=0x%llx cryptid=%u · SC_Info %@",
+                      row.path,
+                      slice.cputype,
+                      slice.cpusubtype,
+                      slice.cryptoff,
+                      slice.cryptsize,
+                      slice.cryptid,
+                      sinfText)
+    }
+
     /// 把 C 层的失败行翻成能照做的建议。最常见的其实是"这台设备没有该账号的
     /// 解密授权"：用哪个账号下载的，就得让那个账号在系统 App Store 登录一次。
     private static func diagnose(firstFailure: String?, failed: Int, stillEncrypted: Int) -> String {
@@ -1196,6 +1257,13 @@ enum FPDecryptor {
             return text
         }
         let lower = raw.lowercased()
+        if lower.contains("cannot allocate memory") {
+            return "fairplayd 无法为该文件建立解密会话（内核返回 ENOMEM，不是账号授权问题）。\n\n"
+                + "常见原因：\n"
+                + "· 这个二进制是 arm64e，或者 SINF 与文件版本对不上（应用刚更新过、或从别的账号/工具装进来的）；\n"
+                + "· 副本位置不被接受。日志里若出现「改用原始安装路径重试」，那是第二条映射路径，也失败了就说明是前者。\n\n"
+                + "这种应用请改用 A · 内核砸壳（它不经过 fairplayd，只要能让目标进程跑起来就能读内存）。"
+        }
         if lower.contains("not permitted") || lower.contains("permission denied") || lower.contains("operation not permitted") {
             return "这台设备没有该 Apple 账号的解密授权，系统拒绝了 FairPlay 解密。\n\n"
                 + "请用下载这个应用时所用的 Apple 账号登录一次系统「App Store」"

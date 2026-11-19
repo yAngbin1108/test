@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
     int mode;
     bool addsigs;
+    bool subtype_masked;
     int sig_errno;
     int mmap_errno;
     int mremap_ret;
@@ -75,6 +76,11 @@ int fp_attempt(const char *path, const fp_slice_t *slice, int mode, bool addsigs
 
 /// 0 = success, 1 = not encrypted (copied as-is), -1 = failure.
 int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, void *ctx);
+
+/// 同 fp_decrypt_file，但映射/读取走 map_path（可以是只读的原始安装路径），
+/// 明文写回由 in_path 复制出来的 out_path。map_path 传 in_path 即普通用法。
+int fp_decrypt_file_ex(const char *in_path, const char *map_path,
+                       const char *out_path, fp_log_t log, void *ctx);
 
 /// Formats one attempt as a single diagnostic line.
 const char *fp_mode_name(int mode);

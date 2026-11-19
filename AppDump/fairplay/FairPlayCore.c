@@ -331,9 +331,10 @@ bool fp_attempt_looks_decrypted(const fp_attempt_t *a) {
 
 void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
     snprintf(buf, len,
-             "%s%s mremap=%d(%s) mmap=%s pages=%llu/%llu changed=%d "
+             "%s%s%s mremap=%d(%s) mmap=%s pages=%llu/%llu changed=%d "
              "code %u->%u entropy %.2f->%.2f %.0fms",
              fp_mode_name(a->mode), a->addsigs ? "+sigs" : "",
+             a->subtype_masked ? "+sub0" : "",
              a->mremap_ret,
              a->mremap_ret == 0 ? "ok" : strerror(a->mremap_errno ? a->mremap_errno : EINVAL),
              a->mmap_errno ? strerror(a->mmap_errno) : "ok",
@@ -551,11 +552,19 @@ static int fp_copy_file(const char *src, const char *dst) {
 }
 
 int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, void *ctx) {
-    if (!in_path || !out_path) return -1;
+    return fp_decrypt_file_ex(in_path, in_path, out_path, log, ctx);
+}
+
+// map_path 与 in_path 可以不同：把"从哪个文件映射并回读明文"和"写回哪个文件"
+// 拆开。已安装应用可以直接映射原始路径（fairplayd 读得到别人的安装包），
+// 明文再写进我们自己的暂存副本，这样拷贝位置就不会影响 fairplayd 的判定。
+int fp_decrypt_file_ex(const char *in_path, const char *map_path,
+                       const char *out_path, fp_log_t log, void *ctx) {
+    if (!in_path || !map_path || !out_path) return -1;
     fp_slice_t slices[FP_MAX_SLICES];
     int count = 0;
     char err[256] = {0};
-    if (fp_parse(in_path, slices, FP_MAX_SLICES, &count, err, sizeof err) != 0) {
+    if (fp_parse(map_path, slices, FP_MAX_SLICES, &count, err, sizeof err) != 0) {
         fp_log(log, ctx, "  parse failed: %s", err);
         return -1;
     }
@@ -597,17 +606,21 @@ int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, voi
     // The READ/cryptid2 attempt is the one that works without PROT_EXEC; the
     // others are fallbacks for releases where the model-encryption path is not
     // reachable.
-    const struct { int mode; bool addsigs; } order[] = {
-        {FP_MODE_R_CID2, false},
-        {FP_MODE_R_CID2, true},
-        {FP_MODE_RX_CID1, false},
-        {FP_MODE_RX_CID1, true},
+    // 最后两条把 cpusubtype 的 ABI/PAC 位抹掉再试：arm64e 二进制上 fairplayd
+    // 有时按 (cputype, cpusubtype) 找不到解密会话，退回纯 arm64 反而能过。
+    const struct { int mode; bool addsigs; bool mask; } order[] = {
+        {FP_MODE_R_CID2, false, false},
+        {FP_MODE_R_CID2, true, false},
+        {FP_MODE_R_CID2, false, true},
+        {FP_MODE_RX_CID1, false, false},
+        {FP_MODE_RX_CID1, true, false},
+        {FP_MODE_RX_CID1, false, true},
     };
 
     int rc = 0;
     for (int i = 0; i < count && rc == 0; i++) {
         const fp_slice_t *s = &slices[i];
-        if (!s->has_enc || s->cryptid == 0) continue;
+        if (!s->has_enc || s->cryptid == 0 || s->cryptsize == 0) continue;
         uint64_t cid_off = s->enc_lc_off + offsetof(struct encryption_info_command, cryptid);
         if (cid_off < s->slice_off || cid_off + 4 > s->slice_off + s->slice_size) {
             fp_log(log, ctx, "  slice[%d] invalid encryption command offset", i);
@@ -618,8 +631,11 @@ int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, voi
         for (size_t k = 0; k < sizeof order / sizeof order[0] && !done; k++) {
             fp_attempt_t attempt;
             char line[512];
-            int attempt_rc = fp_attempt_internal(in_path, s, order[k].mode, order[k].addsigs,
+            fp_slice_t variant = *s;
+            if (order[k].mask) variant.cpusubtype &= ~0xFF000000u;
+            int attempt_rc = fp_attempt_internal(map_path, &variant, order[k].mode, order[k].addsigs,
                                                  NULL, out, &attempt);
+            attempt.subtype_masked = order[k].mask;
             fp_attempt_describe(&attempt, line, sizeof line);
             done = (attempt_rc == 0) && fp_attempt_looks_decrypted(&attempt);
             fp_log(log, ctx, "  slice[%d] %s %s", i, done ? "[OK]" : "[--]", line);
