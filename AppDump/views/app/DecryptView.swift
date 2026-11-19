@@ -115,7 +115,7 @@ struct DecryptView: View {
                         if mode == .apps {
                             if engine == .fairplay {
                                 // B：FairPlay —— 不需要漏洞链，失败只会返回 errno
-                                FairPlayView()
+                                FairPlayView(installedApps: apps)
                                     .safeAreaInset(edge: .top, spacing: 0) { pinnedHeader }
                             } else {
                             // 注意：section 必须直接写在 List 里（不能藏在 some View

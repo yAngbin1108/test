@@ -1005,10 +1005,71 @@ enum FPDecryptor {
         guard let bundleName = payloadEntries.first(where: { $0.hasSuffix(".app") }) else {
             throw FPError.noPayload
         }
+        log("Payload：\(bundleName)")
+
+        return try finish(work: work, stem: stem, staging: stageLabel, started: started,
+                          isCancelled: isCancelled, progress: progress, log: log)
+    }
+
+    /// 已安装应用直砸：不需要 IPA，也不需要内核漏洞。
+    ///
+    /// 磁盘上的二进制本来就是密文（内核只在缺页时解密"映射"，不解密文件），
+    /// 而安装目录里本来就带着 SC_Info/<名字>.sinf。所以只要把整个包拷到
+    /// fairplayd 认可的位置（App Group / App 包内暂存），再让内核替我们把
+    /// 映射解密、回读即可 —— 和用 IPA 走的是同一条路。
+    static func decryptInstalledApp(bundlePath: String,
+                                    appName: String,
+                                    allowBundleStaging: Bool,
+                                    isCancelled: () -> Bool,
+                                    progress: (String, Double, String) -> Void,
+                                    copyBundle: (URL) -> Int,
+                                    log: @escaping (String) -> Void) throws -> Outcome {
+        let started = Date()
+        let manager = FileManager.default
+        guard let (stageLabel, root) = FPStage.prepare(allowBundle: allowBundleStaging) else {
+            throw FPError.noStaging
+        }
+        log("暂存目录：\(stageLabel)")
+
+        let work = root.appendingPathComponent("fpwork-\(UUID().uuidString)", isDirectory: true)
+        let payload = work.appendingPathComponent("Payload", isDirectory: true)
+        let destination = payload.appendingPathComponent((bundlePath as NSString).lastPathComponent,
+                                                         isDirectory: true)
+        try manager.createDirectory(at: destination, withIntermediateDirectories: true)
+        defer { try? manager.removeItem(at: work) }
+
+        progress("拷贝应用包", 0.02, appName)
+        let copied = copyBundle(destination)
+        guard copied > 0 else { throw FPError.refused("无法读取应用包（需要先初始化系统 / 沙箱逃逸）") }
+        log("拷贝完成：\(copied) 个文件")
+        if isCancelled() { throw FPError.cancelled }
+
+        let stem = appName
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+        return try finish(work: work, stem: stem, staging: stageLabel, started: started,
+                          isCancelled: isCancelled, progress: progress, log: log)
+    }
+
+    /// 后面的流水线（解包或拷贝之后共用）：清点 → 铺 SINF → 逐个解密 →
+    /// 重新打包 → 校验导出的文件。
+    private static func finish(work: URL,
+                               stem: String,
+                               staging: String,
+                               started: Date,
+                               isCancelled: () -> Bool,
+                               progress: (String, Double, String) -> Void,
+                               log: @escaping (String) -> Void) throws -> Outcome {
+        let manager = FileManager.default
+
+        let payloadDir = work.appendingPathComponent("Payload", isDirectory: true)
+        let payloadEntries = (try? manager.contentsOfDirectory(atPath: payloadDir.path)) ?? []
+        guard let bundleName = payloadEntries.first(where: { $0.hasSuffix(".app") }) else {
+            throw FPError.noPayload
+        }
         let appDir = payloadDir.appendingPathComponent(bundleName, isDirectory: true)
         let appPrefix = "Payload/\(bundleName)/"
         log("Payload：\(bundleName)")
-
         // ── 3. 清点加密的 Mach-O + 铺 SINF ───────────────────────────
         progress("准备解密", 0.05, bundleName)
         let inventory = FPMachO.scanTree(appDir)
@@ -1124,7 +1185,7 @@ enum FPDecryptor {
         progress("完成", 1, output.lastPathComponent)
         return Outcome(output: output, decrypted: decrypted, plain: plain, failed: failed,
                        machO: after.count, elapsed: Date().timeIntervalSince(started),
-                       clean: clean, verifySummary: verifySummary, staging: stageLabel)
+                       clean: clean, verifySummary: verifySummary, staging: staging)
     }
 
     /// 把 C 层的失败行翻成能照做的建议。最常见的其实是"这台设备没有该账号的
