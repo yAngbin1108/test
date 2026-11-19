@@ -36,6 +36,7 @@ struct santanderitem: Identifiable, Hashable {
         self.isApp = isApp
         self.appUDID = appUDID
         self.display = display ?? name
+        let ext = (path as NSString).pathExtension
         self.type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
         self.meta = meta
     }
