@@ -136,7 +136,19 @@ enum santanderfs {
                     }
                 }
 
-                return santanderitem(path: full, isdir: isdir.boolValue, display: display, isApp: isApp, appUDID: appUDID)
+                // 目录「N 项 · 时间」，文件「大小 · 时间」，与 Blade 的行样式一致
+                let attrs = try? fm.attributesOfItem(atPath: full)
+                let datestr = (attrs?[.modificationDate] as? Date).map { santanderitem.datestring($0) }
+                var meta: String? = datestr
+                if isdir.boolValue {
+                    if let n = (try? fm.contentsOfDirectory(atPath: full))?.count {
+                        meta = "\(n) 项" + (datestr.map { " · \($0)" } ?? "")
+                    }
+                } else if let size = (attrs?[.size] as? NSNumber)?.int64Value {
+                    meta = santanderitem.sizestring(size) + (datestr.map { " · \($0)" } ?? "")
+                }
+
+                return santanderitem(path: full, isdir: isdir.boolValue, display: display, isApp: isApp, appUDID: appUDID, meta: meta)
             }
 
             return santanderlisting(items: items, empty: items.isEmpty ? "目录为空。" : nil)

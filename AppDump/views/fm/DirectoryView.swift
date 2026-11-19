@@ -9,6 +9,12 @@ import SwiftUI
 import Combine
 import UniformTypeIdentifiers
 
+private let dateformatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "M/d/yy HH:mm"
+    return f
+}()
+
 struct santanderitem: Identifiable, Hashable {
     let path: String
     let name: String
@@ -17,10 +23,12 @@ struct santanderitem: Identifiable, Hashable {
     let appUDID: String
     let isdir: Bool
     let type: UTType?
+    /// 行副标题：目录「N 项 · 时间」/ 文件「大小 · 时间」
+    let meta: String?
 
     var id: String { path }
 
-    init(path: String, isdir: Bool, display: String? = nil, isApp: Bool = false, appUDID: String = "") {
+    init(path: String, isdir: Bool, display: String? = nil, isApp: Bool = false, appUDID: String = "", meta: String? = nil) {
         self.path = path
         self.isdir = isdir
         let name = path == "/" ? "/" : (path as NSString).lastPathComponent
@@ -28,8 +36,23 @@ struct santanderitem: Identifiable, Hashable {
         self.isApp = isApp
         self.appUDID = appUDID
         self.display = display ?? name
-        let ext = (path as NSString).pathExtension
         self.type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
+        self.meta = meta
+    }
+
+    static func datestring(_ date: Date) -> String {
+        dateformatter.string(from: date)
+    }
+
+    static func sizestring(_ size: Int64) -> String {
+        let units = ["B", "KB", "MB", "GB"]
+        var value = Double(size)
+        var unit = 0
+        while value >= 1024 && unit < units.count - 1 {
+            value /= 1024
+            unit += 1
+        }
+        return unit == 0 ? "\(Int(value)) B" : String(format: "%.1f %@", value, units[unit])
     }
 
     var icon: String {
@@ -496,6 +519,13 @@ struct santanderdirview: View {
                 
                 if entry.isApp {
                     Text(entry.appUDID)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                if let meta = entry.meta {
+                    Text(meta)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
