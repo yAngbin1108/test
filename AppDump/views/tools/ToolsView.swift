@@ -24,7 +24,6 @@ import SwiftUI
 #if canImport(AdSupport)
 import AdSupport
 #endif
-import Darwin
 
 struct ToolsView: View {
     @ObservedObject private var mgr = AppDumpmgr.shared
@@ -33,36 +32,28 @@ struct ToolsView: View {
     @AppStorage("minimumOSOverride") private var minimumos: String = installrestrict.defaultminimum
 
     @State private var busy = false
-    @State private var showprocs = false
-    @State private var repairing = false
 
     private let minoptions = ["10.0", "12.0", "13.0", "14.0", "15.0", "16.0", "17.0", "18.0"]
 
     var body: some View {
         NavigationStack {
             List {
-                // ---------- 进程管理 / 修复写权限 ----------
+                // ---------- 系统工具 ----------
                 Section {
-                    Button {
-                        showprocs = true
+                    NavigationLink {
+                        ProcessListView()
                     } label: {
                         Label("进程管理", systemImage: "list.bullet.rectangle")
                     }
-
-                    Button {
-                        repairwrite()
+                    NavigationLink {
+                        WritePermView()
                     } label: {
-                        HStack {
-                            Label("修复写权限", systemImage: "lock.open")
-                            Spacer()
-                            if repairing { ProgressView() }
-                        }
+                        Label("修复写权限", systemImage: "folder.badge.gearshape")
                     }
-                    .disabled(repairing)
                 } header: {
-                    HeaderLabel(text: "系统", icon: "cpu")
+                    HeaderLabel(text: "系统", icon: "gearshape.2")
                 } footer: {
-                    Text("进程管理：查看进程列表、结束进程，并对选中进程搜索 / 修改 / 锁定内存（需要先运行漏洞利用）。\n\n修复写权限：先在系统受保护目录真正写一个文件来探测，写不了就重新应用一次沙盒策略——只做一次内存写，不重跑漏洞利用。")
+                    Text("进程管理读取内核进程链表列出全部进程，可修改内存或结束指定进程（系统进程可能导致注销）。修复写权限在内核里把容器文件的 apfs_fsnode 属主改写为 501:501，让写入不再被 UNIX 属主检查拦住。")
                 }
 
                 // ---------- 去除设备限制 ----------
@@ -102,40 +93,9 @@ struct ToolsView: View {
             .toolbarBackground(.hidden, for: .navigationBar)
         }
         .background(AppTheme.background)
-        .sheet(isPresented: $showprocs) {
-            ProcessListView()
-                .ignoresSafeArea()
-        }
     }
 
     // MARK: - actions
-
-    private func repairwrite() {
-        repairing = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let r = WriteAccessRepair.ensure()
-            DispatchQueue.main.async {
-                repairing = false
-                let body: String
-                if r.after {
-                    body = r.before
-                        ? "系统目录本来就可写，无需修复。"
-                        : "已重新应用沙盒策略，系统目录现在可以写入。"
-                } else if r.escapeReturn == -1 {
-                    body = "内核读写还没就绪。请先在「砸壳」页运行漏洞利用，再回来重试。"
-                } else {
-                    body = "还是写不进去（sbx_escape 返回 \(r.escapeReturn)）。\n\n可以先重新运行一次漏洞利用，再点这里。"
-                }
-                Alertinator.shared.alert(
-                    title: r.after ? "写权限正常" : "修复未生效",
-                    body: body,
-                    showCancel: false,
-                    actionLabel: "好",
-                    action: {}
-                )
-            }
-        }
-    }
 
     private func showidfa() {
         #if canImport(AdSupport)

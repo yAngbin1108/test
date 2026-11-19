@@ -15,7 +15,7 @@
 #import "sbx.h"
 #import "decrypt.h"
 #import "AppDumpKernelLock.h"
-#import "ProcessListViewController.h"
+#import "MemoryEditor.h"
 
 #import <zlib.h>
 
