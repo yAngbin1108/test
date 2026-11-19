@@ -12,7 +12,7 @@ struct SantanderView: View {
     let startpath: String
 
     @AppStorage("selectedmethod") private var selectedmethod: method = .hybrid
-    @ObservedObject private var mgr = AppDumpMgr.shared
+    @ObservedObject private var mgr = AppDumpmgr.shared
     
     @State private var showsecret: Bool = false
 
