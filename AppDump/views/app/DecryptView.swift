@@ -50,6 +50,12 @@ enum DecryptMode {
     case apps, ipas
 }
 
+/// 解密引擎：A = 内核砸壳（需要漏洞链），B = FairPlay（需要原始加密 IPA）
+enum DecryptEngine: String {
+    case kernel = "kernel"
+    case fairplay = "fairplay"
+}
+
 struct DecryptView: View {
     @ObservedObject private var mgr = AppDumpmgr.shared
     @State private var query = ""
@@ -59,6 +65,9 @@ struct DecryptView: View {
     @State private var errormsg: String? = nil
     @State private var pendingdecrypt: DecryptApp? = nil
     @State private var loadingapps: Bool = false
+
+    // 解密引擎（持久化，和「降级方式」一样的 A/B 选择）
+    @AppStorage("decryptEngine") private var engineRaw: String = "kernel"
 
     // IPA 管理
     @State private var mode: DecryptMode = .apps
@@ -104,6 +113,11 @@ struct DecryptView: View {
                 ScrollViewReader { proxy in
                     Group {
                         if mode == .apps {
+                            if engine == .fairplay {
+                                // B：FairPlay —— 不需要漏洞链，失败只会返回 errno
+                                FairPlayView()
+                                    .safeAreaInset(edge: .top, spacing: 0) { pinnedHeader }
+                            } else {
                             // 注意：section 必须直接写在 List 里（不能藏在 some View
                             // 计算属性后面），否则 List 的 section 检测失效、全部合并
                             // 成一个隐式 section，sectiongap/索引条都会失灵。
@@ -154,6 +168,7 @@ struct DecryptView: View {
                                         proxy.scrollTo(letter, anchor: .top)
                                     }
                                 }
+                            }
                             }
                         } else {
                             // IPA 管理：改用 ScrollView + 显式卡片布局。
@@ -302,13 +317,14 @@ struct DecryptView: View {
 
     private var pinnedHeader: some View {
         VStack(spacing: 10) {
-            if !fsready {
+            if engine == .kernel && !fsready {
                 statusCard
             }
             if let error = errormsg {
                 errorCard(error)
             }
-            searchCard
+            if engine == .kernel { searchCard }
+            enginePicker
             modePicker
         }
         .padding(.horizontal, 16)
@@ -463,6 +479,26 @@ struct DecryptView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
         .glassCard()
+    }
+
+    private var engine: DecryptEngine {
+        DecryptEngine(rawValue: engineRaw) ?? .kernel
+    }
+
+    private var enginePicker: some View {
+        Picker("", selection: Binding(
+            get: { engine },
+            set: { newValue in
+                engineRaw = newValue.rawValue
+                errormsg = nil
+                query = ""
+            }
+        )) {
+            Text("A · 内核砸壳").tag(DecryptEngine.kernel)
+            Text("B · FairPlay").tag(DecryptEngine.fairplay)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
     }
 
     private var modePicker: some View {

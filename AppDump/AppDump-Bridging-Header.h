@@ -18,6 +18,7 @@
 #import "kcblock.h"
 #import "AppDumpKernelLock.h"
 #import "MemoryEditor.h"
+#import "FairPlayCore.h"
 
 #import <zlib.h>
 
