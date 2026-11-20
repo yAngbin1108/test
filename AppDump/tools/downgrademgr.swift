@@ -115,7 +115,7 @@ enum downgradekind: String {
     }
 }
 
-struct downgradefailure: Identifiable {
+struct downgradefailure: Identifiable, Error {
     let id = UUID()
     let kind: downgradekind
     let title: String
