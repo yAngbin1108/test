@@ -58,9 +58,16 @@ final class FairPlayJob: ObservableObject {
     @Published private(set) var resultText: String? = nil
     @Published private(set) var outputPath: String? = nil
     @Published private(set) var startedAt: Date? = nil
+    /// 用户按了取消、但后台还在把当前文件做完
+    @Published private(set) var cancelling = false
 
     private var token: FPCancelToken?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    // 进度/日志都合批再推给界面：每个 mremap 尝试都会发一行，
+    // 一条条 publish 会让 144 行的应用列表每秒重排几百次，主线程直接卡死。
+    private var pendingprogress: (String, Double, String)?
+    private var pendinglines: [String] = []
+    private var flushscheduled = false
     private var keepaliveWasOff = false
 
     private init() {}
@@ -79,6 +86,10 @@ final class FairPlayJob: ObservableObject {
     }
 
     func cancel() {
+        guard busy, !cancelling else { return }
+        cancelling = true
+        phase = "正在取消…"
+        AppDumpmgr.shared.logmsg("(fairplay) 收到取消请求")
         token?.cancel()
     }
 
@@ -105,7 +116,8 @@ final class FairPlayJob: ObservableObject {
                         DispatchQueue.main.async { self.applyProgress(phase, fraction, detail) }
                     },
                     copyBundle: { destination in
-                        FairPlayCopy.run(from: bundlePath, to: destination.path)
+                        FairPlayCopy.run(from: bundlePath, to: destination.path,
+                                         isCancelled: { token.cancelled })
                     },
                     log: { line in self.append(line) })
                 DispatchQueue.main.async { self.finish(outcome: outcome) }
@@ -144,6 +156,9 @@ final class FairPlayJob: ObservableObject {
 
     private func prepareRun(bundle: String?, ipa: String?) {
         clearResult()
+        cancelling = false
+        pendingprogress = nil
+        pendinglines.removeAll()
         runningBundle = bundle
         runningIPA = ipa
         phase = "准备中"
@@ -153,22 +168,46 @@ final class FairPlayJob: ObservableObject {
     }
 
     private func applyProgress(_ phase: String, _ fraction: Double, _ detail: String) {
-        self.phase = phase
-        self.fraction = min(max(fraction, 0), 1)
-        self.detail = detail
+        pendingprogress = (phase, min(max(fraction, 0), 1), detail)
+        scheduleFlush()
     }
 
     private func append(_ line: String) {
         DispatchQueue.main.async {
-            self.lines.append(line)
-            if self.lines.count > 300 {
-                self.lines.removeFirst(self.lines.count - 300)
-            }
+            self.pendinglines.append(line)
+            self.scheduleFlush()
         }
         AppDumpmgr.shared.logmsg("(fairplay) \(line)")
     }
 
+    /// 最多每 0.15 秒把积攒的进度/日志推一次给界面。
+    private func scheduleFlush() {
+        guard !flushscheduled else { return }
+        flushscheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.flushPending() }
+    }
+
+    private func flushPending() {
+        flushscheduled = false
+        if let progress = pendingprogress {
+            phase = progress.0
+            fraction = progress.1
+            detail = progress.2
+            pendingprogress = nil
+        }
+        if !pendinglines.isEmpty {
+            lines.append(contentsOf: pendinglines)
+            pendinglines.removeAll(keepingCapacity: true)
+            if lines.count > 300 {
+                lines.removeFirst(lines.count - 300)
+            }
+        }
+    }
+
     private func finish(outcome: FPDecryptor.Outcome) {
+        let wasCancelled = cancelling
+        flushPending()
+        cancelling = false
         runningBundle = nil
         runningIPA = nil
         endBackground()
@@ -192,10 +231,12 @@ final class FairPlayJob: ObservableObject {
         AppDumpmgr.shared.logmsg("(fairplay) 完成：\(outcome.output.lastPathComponent)（\(outcome.clean ? "干净" : "部分")）")
 
         NotificationCenter.default.post(name: .appDumpIPAStoreDidChange, object: nil)
-        presentIfReasonablySized(outcome.output)
+        if !wasCancelled { presentIfReasonablySized(outcome.output) }
     }
 
     private func fail(_ error: Error) {
+        flushPending()
+        cancelling = false
         runningBundle = nil
         runningIPA = nil
         endBackground()

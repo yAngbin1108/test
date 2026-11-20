@@ -615,6 +615,12 @@ struct DecryptView: View {
     func loadApps() {
         guard fsready else { return }
         guard !loadingapps else { return }   // 防止重复触发（onAppear + sbxready 变化会各来一次）
+        // FairPlay 任务运行时不要重扫 144 个应用：vfs 会给每个图标刷十几行日志，
+        // 主线程被日志和重排拖死，取消按钮就点不动了。
+        guard !FairPlayJob.shared.busy else {
+            AppDumpmgr.shared.logmsg("(decrypt) 跳过应用列表刷新：FairPlay 任务进行中")
+            return
+        }
         loadingapps = true
         DispatchQueue.global(qos: .userInitiated).async {
             // 沙箱逃逸失败时走 VFS：内核级列目录 + 读 Info.plist / Mach-O，不过沙箱

@@ -146,11 +146,37 @@ final class AppDumpmgr: ObservableObject {
         }
     }
     
+    // 日志同样做成有界 + 合并：`log += ...` 是整串复制，几千行之后每次追加
+    // 都要拷贝几 MB，主线程直接被拖死（点取消没反应就是这个原因）。
+    private static let logCapacity = 100_000
+    private var pendinglog = ""
+    private var logflushscheduled = false
+
     func logmsg(_ message: String) {
         DispatchQueue.main.async {
-            self.log += message + "\n"
-            globallogger.log(message)
+            self.pendinglog += message + "\n"
+            if self.pendinglog.count > 20_000 {
+                self.flushlog()
+            } else if !self.logflushscheduled {
+                self.logflushscheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.flushlog() }
+            }
         }
+        globallogger.log(message)
+    }
+
+    private func flushlog() {
+        logflushscheduled = false
+        guard !pendinglog.isEmpty else { return }
+        var merged = log + pendinglog
+        pendinglog = ""
+        if merged.count > Self.logCapacity {
+            merged = String(merged.suffix(Self.logCapacity))
+            if let newline = merged.firstIndex(of: "\n") {
+                merged = String(merged[merged.index(after: newline)...])
+            }
+        }
+        log = merged
     }
     
     func kread64(address: UInt64) -> UInt64 {
@@ -239,11 +265,23 @@ final class AppDumpmgr: ObservableObject {
         }
     }
     
+    /// 图标/plist 探测时 vfs 会为每个候选路径刷一行，144 个应用能刷上万行，
+    /// 这些纯噪音既不进界面也不进日志正文（文件日志由 globallogger 统一收）。
+    private static let vfsnoise = [
+        "'containers' not in ncache",
+        "vfs_listdir resolvepath failed",
+        "vfs_read open failed",
+        " icon ",
+    ]
+
     private static let vfslogcallback: @convention(c) (UnsafePointer<CChar>?) -> Void = { msg in
         guard let msg = msg else { return }
         let s = String(cString: msg)
+        if vfsnoise.contains(where: { s.contains($0) }) { return }
         DispatchQueue.main.async {
-            AppDumpmgr.shared.vfsinitlog += "(vfs) " + s + "\n"
+            if AppDumpmgr.shared.vfsinitlog.count < 40_000 {
+                AppDumpmgr.shared.vfsinitlog += "(vfs) " + s + "\n"
+            }
             AppDumpmgr.shared.logmsg("(vfs) " + s)
         }
     }

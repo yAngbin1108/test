@@ -99,41 +99,104 @@ class Logger: ObservableObject {
         setuplogfile()
     }
 
+    // 每条日志都在主线程「追加到最后一个条目 + 触发 @Published」，
+    // 一个 3 万行的 vfs 刷屏就会把主线程钉死（字符串每次复制、界面每次重排），
+    // 表现就是「卡住不动，点取消也没反应」。这里改成批量合并 + 有界裁剪，
+    // 文件写入也放到串行后台队列，不再每行 fsync。
+    private var uipending: [String] = []
+    private var uiflushscheduled = false
+    private let filequeue = DispatchQueue(label: "appdump.log.file", qos: .utility)
+    private var filepending: [String] = []
+    private var fileflushscheduled = false
+    private let maxlogentries = 2500
+    private let maxentrychars = 16000
+
     func log(_ message: String) {
+        emit(message)
+        enqueuefile(message)
         DispatchQueue.main.async {
-            let dividersEnabled = !UserDefaults.standard.bool(forKey: self.nobullshitkey)
-            if dividersEnabled && self.pendingdivider {
-                self.divider()
-                self.pendingdivider = false
-            } else if !dividersEnabled {
-                self.pendingdivider = false
-                self.lastwasdivider = false
+            self.uipending.append(message)
+            if self.uipending.count >= 200 {
+                self.flushui()
+            } else if !self.uiflushscheduled {
+                self.uiflushscheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.flushui() }
             }
+        }
+    }
 
-            if message == self.lastmessage {
-                self.repeatCount += 1
-                if let lastIndex = self.logs.indices.last {
-                    self.logs[lastIndex] = "\(message) (\(self.repeatCount + 1)x)"
-                }
-            } else {
-                self.repeatCount = 0
-                if dividersEnabled {
-                    if self.lastwasdivider || self.logs.isEmpty {
-                        self.logs.append(message)
-                    } else {
-                        self.logs[self.logs.count - 1] += "\n" + message
-                    }
-                } else {
-                    self.logs.append(message)
-                }
-                self.lastmessage = message
-            }
+    /// 主线程：把攒下的日志一次性塞进 UI 列表。
+    private func flushui() {
+        uiflushscheduled = false
+        guard !uipending.isEmpty else { return }
+        let batch = uipending
+        uipending.removeAll(keepingCapacity: true)
+        for message in batch { appendui(message) }
+        trim()
+    }
 
+    private func appendui(_ message: String) {
+        let dividersEnabled = !UserDefaults.standard.bool(forKey: self.nobullshitkey)
+        if dividersEnabled && self.pendingdivider {
+            self.divider()
+            self.pendingdivider = false
+        } else if !dividersEnabled {
+            self.pendingdivider = false
             self.lastwasdivider = false
         }
 
-        appendtofile([message])
-        emit(message)
+        if message == self.lastmessage {
+            self.repeatCount += 1
+            if let lastIndex = self.logs.indices.last {
+                self.logs[lastIndex] = "\(message) (\(self.repeatCount + 1)x)"
+            }
+        } else {
+            self.repeatCount = 0
+            if dividersEnabled {
+                if self.lastwasdivider || self.logs.isEmpty {
+                    self.logs.append(message)
+                } else {
+                    self.logs[self.logs.count - 1] += "\n" + message
+                }
+            } else {
+                self.logs.append(message)
+            }
+            self.lastmessage = message
+        }
+
+        self.lastwasdivider = false
+    }
+
+    /// 日志列表有界：条目数、单条目长度都要封顶，否则越滚越慢。
+    private func trim() {
+        if logs.count > maxlogentries {
+            logs.removeFirst(logs.count - maxlogentries)
+        }
+        if let last = logs.last, last.count > maxentrychars {
+            logs[logs.count - 1] = String(last.suffix(maxentrychars))
+        }
+    }
+
+    private func enqueuefile(_ message: String) {
+        filequeue.async {
+            self.filepending.append(message)
+            if self.filepending.count >= 200 {
+                self.flushfile()
+            } else if !self.fileflushscheduled {
+                self.fileflushscheduled = true
+                self.filequeue.asyncAfter(deadline: .now() + 0.5) {
+                    self.fileflushscheduled = false
+                    self.flushfile()
+                }
+            }
+        }
+    }
+
+    private func flushfile() {
+        guard !filepending.isEmpty else { return }
+        let batch = filepending
+        filepending.removeAll(keepingCapacity: true)
+        appendtofile(batch)
     }
 
     func divider() {

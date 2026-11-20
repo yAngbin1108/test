@@ -118,9 +118,10 @@ struct FairPlayView: View {
                             Button(role: .destructive) {
                                 job.cancel()
                             } label: {
-                                Text("取消")
+                                Text(job.cancelling ? "正在取消…" : "取消")
                             }
                             .font(.footnote)
+                            .disabled(job.cancelling)
                         }
                         .padding(.vertical, 2)
                     }
@@ -415,12 +416,18 @@ struct FairPlayView: View {
 
 enum FairPlayCopy {
     /// 沙箱逃逸可用时用 FileManager 直拷（任意大小），否则退回内核 VFS 逐文件读。
-    static func run(from source: String, to destination: String) -> Int {
+    static func run(from source: String, to destination: String,
+                    isCancelled: () -> Bool = { false }) -> Int {
         let manager = FileManager.default
         if AppDumpmgr.shared.sbxready {
             guard let walker = manager.enumerator(atPath: source) else { return 0 }
             var count = 0
             for case let sub as String in walker {
+                // 拷贝是整个流程里最久的一步，必须能中途取消。
+                if count % 64 == 0, isCancelled() {
+                    AppDumpmgr.shared.logmsg("(fairplay) 拷贝中已取消（\(count) 个文件）")
+                    return count
+                }
                 let src = (source as NSString).appendingPathComponent(sub)
                 let dst = (destination as NSString).appendingPathComponent(sub)
                 var isDir: ObjCBool = false
