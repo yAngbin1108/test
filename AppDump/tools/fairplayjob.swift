@@ -18,6 +18,7 @@
 import Foundation
 import SwiftUI
 import UIKit
+import Combine
 
 extension Notification.Name {
     /// 有新的 IPA 写进 Documents/Decrypted 时广播，IPA 页据此即时刷新。
