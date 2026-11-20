@@ -31,6 +31,10 @@ struct DowngradeView: View {
     @State private var errormsg: String? = nil
     @AppStorage(downgrademgr.modeKey) private var dgMode: Int = 1
     @State private var expanded: String? = nil
+    @State private var failure: downgradefailure? = nil
+    @State private var sourcenames: String = ""
+    @State private var versionnote: String = ""
+    @State private var showsources: Bool = false
     @State private var inlinevers: [storeversion] = []
     @State private var loadingvers = false
 
@@ -59,10 +63,55 @@ struct DowngradeView: View {
 
     var body: some View {
         List {
+            if let failure {
+                Section {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Image(systemName: failure.kind.symbol)
+                                .foregroundStyle(.orange)
+                            Text(failure.title)
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        Text(failure.reason)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Text(failure.advice)
+                            .font(.footnote)
+                            .foregroundStyle(.blue)
+                    }
+                    .padding(.vertical, 2)
+
+                    Button("知道了") { self.failure = nil }
+                        .font(.footnote)
+                } header: {
+                    HeaderLabel(text: "为什么失败", icon: "questionmark.circle")
+                }
+            }
+
             if let errormsg {
                 Section {
                     PlainAlert(title: "提示", icon: "exclamationmark.triangle.fill",
                                text: errormsg, color: .red)
+                }
+            }
+
+            Section {
+                NavigationLink {
+                    VersionSourcesView()
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                            .foregroundStyle(.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("版本来源")
+                                .font(.subheadline)
+                            Text(sourcenames.isEmpty ? "正在读取…" : sourcenames)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                    }
                 }
             }
 
@@ -167,7 +216,18 @@ struct DowngradeView: View {
             }
         }
         .onAppear {
+            refreshsourcenames()
             if rows.isEmpty { reload() }
+        }
+        .sheet(isPresented: $showsources) {
+            NavigationStack {
+                VersionSourcesView()
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button("完成") { showsources = false }
+                        }
+                    }
+            }
         }
         // 沙盒逃逸完成时自动重载：用户常在初始化系统之前就点进本页，
         // 那时读不到目录（日志显示 sbx=false 时 FileManager 被拒）。
@@ -222,6 +282,23 @@ struct DowngradeView: View {
                 .font(.caption).foregroundStyle(.tertiary)
         }
         .contentShape(Rectangle())
+    }
+
+    private func refreshsourcenames() {
+        let enabled = versionsources.shared.enabled
+        sourcenames = enabled.isEmpty
+            ? "没有启用的来源"
+            : "已启用 " + enabled.map(\.name).joined(separator: "、")
+    }
+
+    /// 版本行第二行：日期 · 大小 · 版本 ID · 来源
+    private func versionmeta(_ v: storeversion) -> String {
+        var parts: [String] = []
+        if !v.releasedate.isEmpty { parts.append(v.releasedate) }
+        if let size = v.size, !size.isEmpty { parts.append(size) }
+        parts.append("ID \(v.versionid)")
+        if !v.source.isEmpty { parts.append(v.source) }
+        return parts.joined(separator: " · ")
     }
 
     private func versionline(_ item: rowitem) -> String {
@@ -301,11 +378,18 @@ struct DowngradeView: View {
         inlinevers = []
         loadingvers = true
         AppDumpmgr.shared.logmsg("(downgrade) 内联加载版本 tid=\(tid)")
+        versionnote = ""
+        failure = nil
         DispatchQueue.global(qos: .userInitiated).async {
             let list = downgrademgr.shared.history(trackid: tid)
+            let note = downgrademgr.shared.lastversionnote
             DispatchQueue.main.async {
                 inlinevers = list
+                versionnote = note
                 loadingvers = false
+                if list.isEmpty {
+                    failure = downgrademgr.classifyempty(note: note)
+                }
                 AppDumpmgr.shared.logmsg("(downgrade) 内联版本数=\(list.count)")
             }
         }
@@ -321,9 +405,18 @@ struct DowngradeView: View {
             }
             .padding(.vertical, 6)
         } else if inlinevers.isEmpty {
-            Text("没有可用的历史版本记录")
-                .font(.footnote).foregroundStyle(.secondary)
-                .padding(.vertical, 6)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("没有拿到历史版本")
+                    .font(.footnote.weight(.semibold))
+                if !versionnote.isEmpty {
+                    Text(versionnote)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Button("打开版本来源") { showsources = true }
+                    .font(.caption)
+            }
+            .padding(.vertical, 6)
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
@@ -335,16 +428,23 @@ struct DowngradeView: View {
                 }
                 .padding(.bottom, 6)
 
+                if !versionnote.isEmpty {
+                    Text(versionnote)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 4)
+                }
+
                 ForEach(inlinevers) { v in
                     Button {
                         downgrade(item, v)
                     } label: {
                         HStack(alignment: .top, spacing: 8) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("\(v.version) (\(v.versionid))")
+                                Text(v.displayline)
                                     .font(.callout.weight(.semibold))
                                     .foregroundStyle(.blue)
-                                Text(v.releasedate)
+                                Text(versionmeta(v))
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -368,17 +468,17 @@ struct DowngradeView: View {
 
     private func showconfirm(_ item: rowitem, _ v: storeversion, _ store: storeapp) {
         Alertinator.shared.alert(
-            title: "降级 \(item.name) 到 \(v.version)？",
-            body: "将向 App Store 提交下载历史版本 \(v.version) 的请求。\n\n前提：当前 Apple ID 此前下载过该应用；苹果可能随时限制此机制。",
+            title: "降级 \(item.name) 到 \(v.displayline)？",
+            body: "将向 App Store 提交下载历史版本 \(v.displayline) 的请求。\n\n前提：当前 Apple ID 此前下载过该应用；苹果可能随时限制此机制。",
             actionLabel: "开始降级",
             action: {
                 downgrademgr.shared.downgrade(trackid: store.trackid, version: v) { result in
                     switch result {
                     case .success:
-                        AppDumpmgr.shared.logmsg("(downgrade) 降级请求已提交：\(item.name) -> \(v.version)")
+                        AppDumpmgr.shared.logmsg("(downgrade) 降级请求已提交：\(item.name) -> \(v.displayline)")
                     case .failure(let e):
-                        AppDumpmgr.shared.logmsg("(downgrade) 降级失败：\(e.localizedDescription)")
-                        errormsg = e.localizedDescription
+                        AppDumpmgr.shared.logmsg("(downgrade) 降级失败：\(e.reason)")
+                        failure = e
                     }
                 }
             }
