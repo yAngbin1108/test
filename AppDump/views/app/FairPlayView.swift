@@ -54,6 +54,7 @@ struct FairPlayView: View {
     @State private var showEnv = false
     @State private var envLines: [String] = []
     @State private var token = FPCancelToken()
+    @State private var query = ""
     @State private var confirming: FPSourceIPA? = nil
     @State private var installedPending: DecryptApp? = nil
     @State private var runningBundle: String? = nil
@@ -66,8 +67,55 @@ struct FairPlayView: View {
 
     private var busy: Bool { running != nil || runningBundle != nil }
 
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var filteredApps: [DecryptApp] {
+        let q = trimmedQuery.lowercased()
+        guard !q.isEmpty else { return installedApps }
+        return installedApps.filter {
+            $0.name.lowercased().contains(q) || $0.bundleID.lowercased().contains(q)
+        }
+    }
+
+    private var filteredIPAs: [FPSourceIPA] {
+        let q = trimmedQuery.lowercased()
+        guard !q.isEmpty else { return ipas }
+        return ipas.filter { $0.name.lowercased().contains(q) }
+    }
+
     var body: some View {
         List {
+            Section {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                    TextField("搜索应用或 IPA", text: $query)
+                        .font(.body)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(Color.secondary.opacity(0.6))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Button {
+                        loadIPAs()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.blue)
+                    }
+                    .disabled(busy)
+                }
+            }
+
             if let errormsg {
                 Section {
                     PlainAlert(title: "解密失败", icon: "exclamationmark.triangle.fill",
@@ -152,12 +200,14 @@ struct FairPlayView: View {
             }
 
             Section {
-                if installedApps.isEmpty {
-                    Text("尚未读取到已安装应用。若「内核」页还没初始化，请先去初始化系统；也可以直接用下面的 IPA。")
+                if filteredApps.isEmpty {
+                    Text(trimmedQuery.isEmpty
+                         ? "尚未读取到已安装应用。若「内核」页还没初始化，请先去初始化系统；也可以直接用下面的 IPA。"
+                         : "没有匹配的应用。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(installedApps) { app in
+                    ForEach(filteredApps) { app in
                         Button {
                             installedPending = app
                         } label: {
@@ -187,7 +237,7 @@ struct FairPlayView: View {
                 }
             } header: {
                 HStack {
-                    HeaderLabel(text: "已安装应用 \(installedApps.count)", icon: "square.grid.2x2")
+                    HeaderLabel(text: "已安装应用 \(filteredApps.count)", icon: "square.grid.2x2")
                     Spacer()
                 }
             } footer: {
@@ -206,12 +256,14 @@ struct FairPlayView: View {
                 }
                 .disabled(busy)
 
-                if ipas.isEmpty {
-                    Text("Documents 里还没有 .ipa 文件。用「导入加密 IPA」选一个从 App Store 下载的安装包。")
+                if filteredIPAs.isEmpty {
+                    Text(trimmedQuery.isEmpty
+                         ? "Documents 里还没有 .ipa 文件。用「导入加密 IPA」选一个从 App Store 下载的安装包。"
+                         : "没有匹配的 IPA。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(ipas) { ipa in
+                    ForEach(filteredIPAs) { ipa in
                         Button {
                             confirming = ipa
                         } label: {
@@ -240,7 +292,7 @@ struct FairPlayView: View {
                 }
             } header: {
                 HStack {
-                    HeaderLabel(text: "来源 IPA \(ipas.count)", icon: "tray.full")
+                    HeaderLabel(text: "来源 IPA \(filteredIPAs.count)", icon: "tray.full")
                     Spacer()
                     Button("刷新") { loadIPAs() }
                         .font(.caption)
