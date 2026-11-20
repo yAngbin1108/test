@@ -43,18 +43,22 @@ enum vfsfs {
     static func readdict(_ path: String, maxSize: Int = 8 * 1024 * 1024) -> NSDictionary? {
         // VFS 对未进 namecache 的路径会失败（日志 "'containers' not in ncache"），
         // 而沙盒逃逸后 FileManager 能正常读。只走 VFS 会让整列应用「无 plist」而消失。
-        // 沙盒已逃逸时先用 POSIX 读，避免 VFS 的 namecache 遍历。
+        // 沙盒已逃逸时 POSIX 是首选。注意：不能用 `sbxready && POSIX 成功` 当条件再
+        // 落到 VFS 上 —— POSIX 一读不出来就掉进 vfsread，而 vfsread 是 open(2)+pread，
+        // 照样吃沙箱，日志只会多一条 "vfs_read open failed"，然后继续往下走。
+        // （图标那一路以前就是这么丢的：*每次* 都先去 VFS 试 @3x.png，文件不存在时
+        //  每次打印一条失败日志并多一次内核 resolvepath。）
         if AppDumpmgr.shared.sbxready,
            let d = NSDictionary(contentsOfFile: path) { return d }
-        if AppDumpmgr.shared.vfsready,
-           let data = AppDumpmgr.shared.vfsread(path: path, maxSize: maxSize), !data.isEmpty,
-           let d = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? NSDictionary {
-            return d
-        }
         guard AppDumpmgr.shared.sbxready || AppDumpmgr.shared.vfsready else { return nil }
 
-        // 回退一：FileManager 直读
-        if let d = NSDictionary(contentsOfFile: path) { return d }
+        // 回退一：VFS 读（内核级。vfsread 内部是 open/pread，所以排在上面 POSIX 之后）
+        if AppDumpmgr.shared.vfsready,
+           let data = AppDumpmgr.shared.vfsread(path: path, maxSize: maxSize), !data.isEmpty {
+            if let d = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? NSDictionary {
+                return d
+            }
+        }
 
         // 回退二：FileManager 取 Data 再解析（有些二进制 plist contentsOfFile 读不了）
         if let data = FileManager.default.contents(atPath: path), !data.isEmpty,
@@ -131,30 +135,151 @@ enum vfsfs {
         let icon: UIImage?
     }
 
+    // MARK: - 图标
+
+    private static let iconcache = NSCache<NSString, UIImage>()
+
+    /// 直接读一个图片文件：POSIX 优先，失败再问 VFS。
+    /// 以前这里是 VFS 优先，且每试一个候选就调一次 vfsread ——
+    /// 候选大多不存在，于是每个 App 都要打一串 "vfs_read open failed: No such file or directory"
+    /// （日志被灌满），还要多做几次内核 resolvepath。
+    private static func readimage(_ path: String) -> UIImage? {
+        if let img = UIImage(contentsOfFile: path) { return img }
+        guard AppDumpmgr.shared.vfsready else { return nil }
+        if let data = AppDumpmgr.shared.vfsread(path: path, maxSize: 4 * 1024 * 1024),
+           let img = UIImage(data: data) { return img }
+        return nil
+    }
+
+    /// 从 bundle 里挑一个像图标的 PNG（主图标名字对不上时的兜底）。
+    /// 自签 / 未签名的侧载包常见问题：Info.plist 里 CFBundleIconFiles 写的是
+    /// "AppIcon60x60"，但包里实际叫 "AppIcon60x60@2x.png"、"icon-1024.png"、
+    /// 或者只有 iOS 11+ 的 CFBundlePrimaryIcon 之外还多一层 UISettings 变体。
+    /// 这里把 bundle 根目录的 PNG 全列一遍，按名字打分取最高的一个。
+    private static func findiconfile(appdir: String) -> String? {
+        let names: [String]
+        if let via = AppDumpmgr.shared.vfslistdir(path: appdir), !via.isEmpty {
+            names = via.map { $0.name }
+        } else if let via = try? FileManager.default.contentsOfDirectory(atPath: appdir) {
+            names = via
+        } else {
+            return nil
+        }
+        var best: (String, Int)? = nil
+        for n in names {
+            let lower = n.lowercased()
+            guard lower.hasSuffix(".png") || lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg") else { continue }
+            var score = 0
+            if lower.contains("appicon") { score += 100 }
+            if lower.contains("icon") { score += 50 }
+            if lower.contains("@3x") { score += 30 } else if lower.contains("@2x") { score += 20 }
+            if lower.contains("1024") { score += 10 }
+            if lower.contains("small") || lower.contains("settings") || lower.contains("notification")
+                || lower.contains("spotlight") || lower.contains("tile") || lower.contains("marketing") {
+                score -= 40
+            }
+            if score > (best?.1 ?? -1) { best = (appdir + "/" + n, score) }
+        }
+        return best?.0
+    }
+
+    /// 从 Assets.car 里取图标：拷到 App 自己的 tmp，再用 ImageIO 读并缩放成 PNG。
+    /// （Assets.car 是只有 ImageIO 才认识的容器，UIImage(data:) 解不开。）
+    private static func loadiconfromcatalogs(appdir: String) -> UIImage? {
+        let fm = FileManager.default
+        for catalog in ["Assets.car", "AppIcon60x60.car"] {
+            let src = appdir + "/" + catalog
+            let size = AppDumpmgr.shared.vfssize(path: src)
+            let local = NSTemporaryDirectory() + "appd-\(abs(src.hashValue)).car"
+            // 先 POSIX（沙盒逃逸后可用），再 VFS。vfsread 内部是 open/pread，同样吃沙箱，
+            // 所以顺序不能反：反了就是每个没逃逸的 App 都多一条 open failed。
+            var ok = false
+            if let d = FileManager.default.contents(atPath: src), !d.isEmpty {
+                ok = (try? d.write(to: URL(fileURLWithPath: local))) != nil
+            } else if size > 0, let d = AppDumpmgr.shared.vfsread(path: src, maxSize: 64 * 1024 * 1024) {
+                ok = (try? d.write(to: URL(fileURLWithPath: local))) != nil
+            }
+            guard ok,
+                  let s = CGImageSourceCreateWithURL(URL(fileURLWithPath: local) as CFURL, nil) else {
+                try? fm.removeItem(atPath: local)
+                continue
+            }
+            // Assets.car 里的图标名按优先级尝试
+            let keys = ["AppIcon60x60@3x", "AppIcon60x60@2x", "AppIcon60x60",
+                        "AppIcon", "Icon60x60", "AppIcon76x76@2x"]
+            for key in keys {
+                if let cg = CGImageSourceCreateImageAtIndex(
+                    s, CGImageSourceGetIndex(s, key as CFString) ?? 0, nil) {
+                    try? fm.removeItem(atPath: local)
+                    return UIImage(cgImage: cg)
+                }
+            }
+            // 名字对不上：把资产表前 8 项的名字打出来，方便下次按真实名字加键
+            let count = CGImageSourceGetCount(s)
+            log("Assets.car \(catalog) 含 \(count) 张图，前 8 个名字：")
+            for i in 0..<min(count, 8) {
+                let props = CGImageSourceCopyPropertiesAtIndex(s, i, nil) as? [String: Any]
+                log("  [\(i)] \(props?[kCGImagePropertyAssetCatalogName as String] ?? props?[kCGImagePropertyName as String] ?? "?")")
+            }
+            try? fm.removeItem(atPath: local)
+        }
+        return nil
+    }
+
+    /// 给视图层用的图标入口（带缓存）
+    static func iconforapp(appdir: String, info: NSDictionary) -> UIImage? {
+        loadicon(appdir: appdir, info: info)
+    }
+
     private static func loadicon(appdir: String, info: NSDictionary) -> UIImage? {
+        let ck = appdir as NSString
+        if let cached = iconcache.object(forKey: ck) { return cached }
+
         var names: [String] = []
+        // iOS 11+ 主图标
         if let icons = info["CFBundleIcons"] as? [String: Any],
            let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
            let files = primary["CFBundleIconFiles"] as? [String] {
             names = files
         }
-        if names.isEmpty, let files = info["CFBundleIconFiles"] as? [String] {
-            names = files
+        // iOS 5~10
+        if let files = info["CFBundleIconFiles"] as? [String], !files.isEmpty {
+            names += files
         }
-        for base in names.reversed() {
-            for suffix in ["@3x.png", "@2x.png", ".png", ""] {
+        // CFBundleIconName 是 iOS 11+ 的 Assets.car 键，包里未必有同名 PNG，
+        // 但很多侧载包把它写成了 PNG 的文件名，试一下不吃亏。
+        if let n = info["CFBundleIconName"] as? String, !n.isEmpty {
+            names.append(n)
+        }
+
+        let candidates = names.reversed()   // 最大尺寸在数组末尾
+        for base in candidates {
+            var tried = Set<String>()
+            for suffix in ["@3x.png", "@2x.png", ".png", "@3x.jpg", ".jpg"] {
                 let p = appdir + "/" + base + suffix
-                // VFS 优先，失败回退 FileManager（沙盒逃逸后可用）
-                if AppDumpmgr.shared.vfsready,
-                   let data = AppDumpmgr.shared.vfsread(path: p, maxSize: 4 * 1024 * 1024),
-                   let img = UIImage(data: data) {
-                    return img
-                }
-                if let d = FileManager.default.contents(atPath: p), let img = UIImage(data: d) {
+                if tried.contains(p) { continue }
+                tried.insert(p)
+                if let img = readimage(p) {
+                    iconcache.setObject(img, forKey: ck)
                     return img
                 }
             }
         }
+
+        // 最后兜底：bundle 里挑一个像图标的 PNG
+        if let p = findiconfile(appdir: appdir), let img = readimage(p) {
+            log("图标兜底：\(p)")
+            iconcache.setObject(img, forKey: ck)
+            return img
+        }
+
+        // 再兜底：很多包只留 Assets.car，没有散装 PNG。
+        // 先拷到本地再让 ImageIO 读 —— UIImage(contentsOfFile:) 直接读系统路径会吃沙箱。
+        if let img = loadiconfromcatalogs(appdir: appdir) {
+            iconcache.setObject(img, forKey: ck)
+            return img
+        }
+        log("图标缺失：\(appdir)（plist 候选 \(names.joined(separator: ","))）")
         return nil
     }
 
@@ -179,7 +304,12 @@ enum vfsfs {
         }
         log("根目录容器数：\(containers.count)")
 
-        var out: [bundleapp] = []
+        // 第一遍只列目录 + 读 Info.plist（不做图标），第二遍并行加载图标。
+        // 负责地串行解图标时，一旦解码失败就会走 Assets.car 兜底（要读整个 car），
+        // 96 个 App 串下来界面会卡好几百毫秒；并行 + 缓存后一遍就热。
+        struct pending { let appdir: String; let info: NSDictionary; let bundleid: String
+                         let name: String; let ex: String }
+        var pendingapps: [pending] = []
         var subnil = 0, noapp = 0, noplist = 0
         var firsterr = ""
         for c in containers where c.isDir {
@@ -204,8 +334,8 @@ enum vfsfs {
                 let name = (info["CFBundleDisplayName"] as? String)
                     ?? (info["CFBundleName"] as? String)
                     ?? (item.name as NSString).deletingPathExtension
-                out.append(bundleapp(bundleid: bid, name: name, executable: ex,
-                                     path: appdir, icon: loadicon(appdir: appdir, info: info)))
+                pendingapps.append(pending(appdir: appdir, info: info, bundleid: bid,
+                                           name: name, ex: ex))
                 break
             }
             if !foundapp {
@@ -216,7 +346,31 @@ enum vfsfs {
                 }
             }
         }
-        log("listappbundles 统计：容器=\(containers.count) 读不到=\(subnil) 无app=\(noapp) 无plist=\(noplist) 结果=\(out.count)")
+
+        var icons = [UIImage?](repeating: nil, count: pendingapps.count)
+        let lock = NSLock()
+        var cursor = 0
+        let total = pendingapps.count
+        DispatchQueue.concurrentPerform(iterations: max(1, min(total, 8))) { _ in
+            while true {
+                lock.lock()
+                let idx = cursor
+                cursor += 1
+                lock.unlock()
+                guard idx < total else { return }
+                let p = pendingapps[idx]
+                let img = loadicon(appdir: p.appdir, info: p.info)
+                lock.lock()
+                icons[idx] = img
+                lock.unlock()
+            }
+        }
+        let out: [bundleapp] = pendingapps.enumerated().map { i, p in
+            bundleapp(bundleid: p.bundleid, name: p.name, executable: p.ex,
+                      path: p.appdir, icon: icons[i])
+        }
+        let noicon = icons.filter { $0 == nil }.count
+        log("listappbundles 统计：容器=\(containers.count) 读不到=\(subnil) 无app=\(noapp) 无plist=\(noplist) 结果=\(out.count) 无图标=\(noicon)")
         if !firsterr.isEmpty { log("首个异常：\(firsterr)") }
         log("listed \(out.count) app bundles")
         return out

@@ -662,16 +662,9 @@ struct DecryptView: View {
                                (info["CFBundleName"] as? String) ??
                                (item as NSString).deletingPathExtension
 
-                    var icon: UIImage? = nil
-                    if let icons = info["CFBundleIcons"] as? [String: Any],
-                       let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
-                       let iconfiles = primary["CFBundleIconFiles"] as? [String],
-                       let iconname = iconfiles.last {
-                        let iconpath = fullAppPath + "/" + iconname
-                        if let img = UIImage(contentsOfFile: iconpath) { icon = img }
-                        else if let img = UIImage(contentsOfFile: iconpath + "@2x.png") { icon = img }
-                        else if let img = UIImage(contentsOfFile: iconpath + ".png") { icon = img }
-                    }
+                    // 图标统一走 vfsfs 的加载器（POSIX/VFS 双通道 + 文件名兜底 + Assets.car），
+                    // 这里原来只认 CFBundlePrimaryIcon 的 @2x/.png 三个候选，自签包很容易一个都不中。
+                    let icon = vfsfs.iconforapp(appdir: fullAppPath, info: info)
 
                     let encResult = is_encrypted(fullAppPath, executable)
                     let status: DecryptStatus
