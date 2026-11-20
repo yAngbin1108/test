@@ -183,8 +183,9 @@ enum vfsfs {
         return best?.0
     }
 
-    /// 从 Assets.car 里取图标：拷到 App 自己的 tmp，再用 ImageIO 读并缩放成 PNG。
-    /// （Assets.car 是只有 ImageIO 才认识的容器，UIImage(data:) 解不开。）
+    /// 从 Assets.car 里取图标：拷到 App 自己的 tmp，再交给 ImageIO。
+    /// Assets.car 只有 ImageIO 认识（UIImage(data:) / CGImageSourceCreateImageAtIndex
+    /// 对 car 都只返回失败），要用 CGImageSourceCopyNamedImageAtIndex 按名字取。
     private static func loadiconfromcatalogs(appdir: String) -> UIImage? {
         let fm = FileManager.default
         for catalog in ["Assets.car", "AppIcon60x60.car"] {
@@ -199,27 +200,18 @@ enum vfsfs {
             } else if size > 0, let d = AppDumpmgr.shared.vfsread(path: src, maxSize: 64 * 1024 * 1024) {
                 ok = (try? d.write(to: URL(fileURLWithPath: local))) != nil
             }
-            guard ok,
-                  let s = CGImageSourceCreateWithURL(URL(fileURLWithPath: local) as CFURL, nil) else {
-                try? fm.removeItem(atPath: local)
-                continue
-            }
-            // Assets.car 里的图标名按优先级尝试
-            let keys = ["AppIcon60x60@3x", "AppIcon60x60@2x", "AppIcon60x60",
-                        "AppIcon", "Icon60x60", "AppIcon76x76@2x"]
-            for key in keys {
-                if let cg = CGImageSourceCreateImageAtIndex(
-                    s, CGImageSourceGetIndex(s, key as CFString) ?? 0, nil) {
-                    try? fm.removeItem(atPath: local)
-                    return UIImage(cgImage: cg)
+            if ok,
+               let s = CGImageSourceCreateWithURL(URL(fileURLWithPath: local) as CFURL, nil) {
+                // 先按图标名试，再按资产表下标试（下标 0 通常就是最大那张）
+                let keys = ["AppIcon60x60@3x", "AppIcon60x60@2x", "AppIcon60x60",
+                            "AppIcon", "Icon60x60", "AppIcon76x76@2x"]
+                for i in 0..<max(CGImageSourceGetCount(s), 1) {
+                    let key = i < keys.count ? keys[i] : nil
+                    if let cg = CGImageSourceCopyNamedImageAtIndex(s, i, key, nil) as CGImage? {
+                        try? fm.removeItem(atPath: local)
+                        return UIImage(cgImage: cg)
+                    }
                 }
-            }
-            // 名字对不上：把资产表前 8 项的名字打出来，方便下次按真实名字加键
-            let count = CGImageSourceGetCount(s)
-            log("Assets.car \(catalog) 含 \(count) 张图，前 8 个名字：")
-            for i in 0..<min(count, 8) {
-                let props = CGImageSourceCopyPropertiesAtIndex(s, i, nil) as? [String: Any]
-                log("  [\(i)] \(props?[kCGImagePropertyAssetCatalogName as String] ?? props?[kCGImagePropertyName as String] ?? "?")")
             }
             try? fm.removeItem(atPath: local)
         }
