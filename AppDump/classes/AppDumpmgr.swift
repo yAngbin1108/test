@@ -247,6 +247,10 @@ final class AppDumpmgr: ObservableObject {
                 if self.sbxready {
                     self.sbxfailed = false
                     self.logmsg("\nsandbox escape ready!\n")
+                    // blade: 逃逸成功后启动写权限守护。策略是易失的，内核会
+                    // 把它覆盖回磁盘上的 profile；后台探针只重放策略那一次
+                    // 内存写，不重跑漏洞链。
+                    SandboxKeeper.shared.start()
                 } else {
                     self.sbxfailed = true
                     self.logmsg("\nsandbox escape failed.\n")
@@ -373,10 +377,24 @@ final class AppDumpmgr: ObservableObject {
     
     private func sbxoverwrite(path: String, data: Data) -> (ok: Bool, message: String) {
         let immutableMessage = clearImmutableForOverwriteIfNeeded(path: path)
-        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        // blade: SKEnsureWriteAccess —— 容器里的属主（父目录要属于 mobile）
+        // 与沙盒策略缺一个都写不进去，先补上再开文件。
+        _ = WritePerm.ensureWriteAccess(path)
+
+        var fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         if fd == -1 {
-            let prefix = immutableMessage.map { "\($0), " } ?? ""
-            return (false, "\(prefix)sbx open failed: errno=\(errno) \(String(cString: strerror(errno)))")
+            // 策略是易失的：上一次写可能刚好赶上内核重新推导策略。重放一次
+            // 逃逸再试，行为和 blade 文件管理器一致（失败 → 修属主 → 重试）。
+            let firstErrno = errno
+            if firstErrno == EACCES || firstErrno == EPERM {
+                _ = SandboxKeeper.shared.restoreIfLost("文件操作")
+                _ = WritePerm.kernelTakeOwnership(path)
+                fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            }
+            if fd == -1 {
+                let prefix = immutableMessage.map { "\($0), " } ?? ""
+                return (false, "\(prefix)sbx open failed: errno=\(errno) \(String(cString: strerror(errno)))")
+            }
         }
         defer { close(fd) }
         

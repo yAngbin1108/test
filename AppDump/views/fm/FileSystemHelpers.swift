@@ -315,6 +315,11 @@ enum santanderfs {
             return AppDumpmgr.shared.vfsoverwritewithdata(target: path, data: data)
         }
         guard readsbx else { return false }
+        // 沙盒策略是易失的：写之前确认一次，丢了就重放（不重跑漏洞链）。
+        guard SandboxKeeper.shared.ensureWriteAccess() else {
+            AppDumpmgr.shared.logmsg("[fm] 写权限不可用（errno \(SandboxKeeper.writeAccessProbeErrno)），放弃写入: \(path)")
+            return false
+        }
         do {
             clearImmutableIfPossible(atPath: path)
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)

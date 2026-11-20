@@ -97,6 +97,9 @@ final class santanderdirmodel: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let listing = santanderfs.listdir(item: item, readsbx: readsbx)
+            // blade: SKOwnershipFixAsync(currentPath) —— 浏览进容器就顺手把
+            // 属主修好，后面的写入不用再等（每个根每次启动只跑一次）。
+            if readsbx { WritePerm.fixAsync(item.path) }
             let shown = santanderfs.filteritems(
                 all: listing.items,
                 base: item.path,
