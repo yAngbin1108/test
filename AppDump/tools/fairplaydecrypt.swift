@@ -1247,14 +1247,23 @@ enum FPDecryptor {
            let size = attrs[.size] as? NSNumber {
             sinfText = "\(size.intValue) B"
         }
-        return String(format: "%@ · cpu=0x%x/0x%x cryptoff=0x%llx cryptsize=0x%llx cryptid=%u · SC_Info %@",
+        // cryptoff 不是 16 KB 页对齐时，内核 mremap_encrypted 根本不会接受
+        // 那个地址。C 层现在会从页首重试，这里把情况标出来，便于看日志。
+        var alignNote = ""
+        let kernelPage = UInt64(getpagesize() > 0 ? getpagesize() : 16384)
+        if slice.cryptoff % kernelPage != 0 {
+            alignNote = String(format: " · ⚠️ cryptoff 未按 %llu KB 页对齐，改从页首映射重试",
+                               kernelPage / 1024)
+        }
+        return String(format: "%@ · cpu=0x%x/0x%x cryptoff=0x%llx cryptsize=0x%llx cryptid=%u · SC_Info %@%@",
                       row.path,
                       slice.cputype,
                       slice.cpusubtype,
                       slice.cryptoff,
                       slice.cryptsize,
                       slice.cryptid,
-                      sinfText)
+                      sinfText,
+                      alignNote)
     }
 
     /// 把 C 层的失败行翻成能照做的建议。最常见的其实是"这台设备没有该账号的
@@ -1280,7 +1289,10 @@ enum FPDecryptor {
         }
         text += "\n内核返回：\(raw)"
         if lower.contains("invalid argument") {
-            text += "\n映射参数被拒绝：确认包内每个加密二进制旁边都有同名 SC_Info/<名称>.sinf。"
+            text += "\n映射参数被拒绝：多半是这个二进制的 cryptoff 不是 16 KB 页对齐，"
+                + "内核只接受页对齐的 mremap_encrypted 地址（日志里带 ⚠️ 的行）。"
+                + "日志中 +slack 表示已从页首重试；仍失败说明这几页本身按别的页大小加密，"
+                + "任何 FairPlay 工具都解不了，只能用 A · 内核砸壳。"
         }
         return text
     }

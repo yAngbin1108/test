@@ -330,11 +330,13 @@ bool fp_attempt_looks_decrypted(const fp_attempt_t *a) {
 }
 
 void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
+    char slack[24] = "";
+    if (a->page_slack) snprintf(slack, sizeof slack, "+slack0x%x", a->page_slack);
     snprintf(buf, len,
-             "%s%s%s mremap=%d(%s) mmap=%s pages=%llu/%llu changed=%d "
+             "%s%s%s%s mremap=%d(%s) mmap=%s pages=%llu/%llu changed=%d "
              "code %u->%u entropy %.2f->%.2f %.0fms",
              fp_mode_name(a->mode), a->addsigs ? "+sigs" : "",
-             a->subtype_masked ? "+sub0" : "",
+             a->subtype_masked ? "+sub0" : "", slack,
              a->mremap_ret,
              a->mremap_ret == 0 ? "ok" : strerror(a->mremap_errno ? a->mremap_errno : EINVAL),
              a->mmap_errno ? strerror(a->mmap_errno) : "ok",
@@ -359,7 +361,15 @@ static int fp_attempt_internal(const char *path, const fp_slice_t *s, int mode, 
     const uint64_t page = (uint64_t)pg;
     if (!s->has_enc || s->cryptsize == 0) return -1;
     if (s->slice_off % page) { res->mmap_errno = EINVAL; return -1; }
-    if (s->cryptoff % page) { res->mremap_errno = EINVAL; return -1; }
+
+    // mremap_encrypted() 要求地址页对齐（arm64 iOS 是 16 KB）。不少第三方重打包
+    // 的 appex 只按 4 KB 对齐 cryptoff（0x1f000、0x6d000…），以前这里直接判失败，
+    // 日志表现为「mremap=-1(Invalid argument) entropy 0.00 0ms」——一次也没真试。
+    // 现在改成从 cryptoff 所在页的页首开始映射并请求解密，回读时只取
+    // [cryptoff, cryptoff+cryptsize) 那一段写回，页首的明文原样保留。
+    const uint64_t page_start = (uint64_t)s->cryptoff & ~(page - 1);
+    const uint64_t slack = (uint64_t)s->cryptoff - page_start;
+    res->page_slack = (uint32_t)slack;
 
     int fd = open(path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0) { res->mmap_errno = errno; return -1; }
@@ -396,14 +406,22 @@ static int fp_attempt_internal(const char *path, const fp_slice_t *s, int mode, 
         close(fd);
         return -1;
     }
-    uint64_t map_len = (crypt_end + page - 1) & ~(page - 1);
+    uint64_t span = slack + (uint64_t)s->cryptsize;
+    if (span > UINT64_MAX - (page - 1) ||
+        (uint64_t)s->slice_off > UINT64_MAX - page_start) {
+        res->mmap_errno = EOVERFLOW;
+        close(fd);
+        return -1;
+    }
+    uint64_t map_off = (uint64_t)s->slice_off + page_start;
+    uint64_t map_len = (span + page - 1) & ~(page - 1);
     if (map_len == 0 || map_len > SIZE_MAX || (uint64_t)s->cryptsize > SIZE_MAX) {
         res->mmap_errno = EOVERFLOW;
         close(fd);
         return -1;
     }
     int prot = PROT_READ | (mode == FP_MODE_RX_CID1 ? PROT_EXEC : 0);
-    uint8_t *base = mmap(NULL, (size_t)map_len, prot, MAP_PRIVATE, fd, (off_t)s->slice_off);
+    uint8_t *base = mmap(NULL, (size_t)map_len, prot, MAP_PRIVATE, fd, (off_t)map_off);
     if (base == MAP_FAILED) {
         res->mmap_errno = errno;
         close(fd);
@@ -455,7 +473,9 @@ static int fp_attempt_internal(const char *path, const fp_slice_t *s, int mode, 
 
     uint32_t cryptid = (mode == FP_MODE_R_CID2) ? 2 : 1;
     errno = 0;
-    res->mremap_ret = fp_mremap_encrypted(base + s->cryptoff, s->cryptsize, cryptid,
+    // base 对应 map_off（页对齐），加密区间从 base + slack 开始；内核只接受
+    // 页对齐地址，所以从页首请求解密，长度覆盖到 cryptsize 结束。
+    res->mremap_ret = fp_mremap_encrypted(base, (size_t)span, cryptid,
                                           s->cputype, s->cpusubtype);
     res->mremap_errno = res->mremap_ret == 0 ? 0 : errno;
 
@@ -478,7 +498,7 @@ static int fp_attempt_internal(const char *path, const fp_slice_t *s, int mode, 
                 vm_size_t got = 0;
                 kern_return_t kr = vm_read_overwrite(
                     mach_task_self(),
-                    (vm_address_t)(base + s->cryptoff + off + p_off),
+                    (vm_address_t)(base + slack + off + p_off),
                     (vm_size_t)n,
                     (vm_address_t)(dst + p_off),
                     &got);
