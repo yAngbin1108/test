@@ -33,6 +33,14 @@
 import Foundation
 import UIKit
 
+// Assets.car 没有公开 API：按名字取图的是私有的 CGImageSourceCopyNamedImageAtIndex
+// （ImageIO 内部有，但头文件不导出）。这里自己声明一下，运行时直接 dlsym 找到。
+private typealias namedimagefn = @convention(c) (CGImageSource, Int, CFString?, UnsafeRawPointer?) -> Unmanaged<CGImage>?
+
+private final class imageiohelper {
+    static let named = unsafeBitCast(dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGImageSourceCopyNamedImageAtIndex"), to: namedimagefn?.self)
+}
+
 enum vfsfs {
 
     private static func log(_ m: String) { AppDumpmgr.shared.logmsg("(vfsfs) \(m)") }
@@ -205,11 +213,13 @@ enum vfsfs {
                 // 先按图标名试，再按资产表下标试（下标 0 通常就是最大那张）
                 let keys = ["AppIcon60x60@3x", "AppIcon60x60@2x", "AppIcon60x60",
                             "AppIcon", "Icon60x60", "AppIcon76x76@2x"]
-                for i in 0..<max(CGImageSourceGetCount(s), 1) {
-                    let key = i < keys.count ? keys[i] : nil
-                    if let cg = CGImageSourceCopyNamedImageAtIndex(s, i, key, nil) as CGImage? {
-                        try? fm.removeItem(atPath: local)
-                        return UIImage(cgImage: cg)
+                if let fn = imageiohelper.named {
+                    for i in 0..<max(CGImageSourceGetCount(s), 1) {
+                        let key: CFString? = i < keys.count ? keys[i] as CFString : nil
+                        if let cg = fn(s, i, key, nil)?.takeRetainedValue() {
+                            try? fm.removeItem(atPath: local)
+                            return UIImage(cgImage: cg)
+                        }
                     }
                 }
             }
