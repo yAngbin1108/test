@@ -34,6 +34,8 @@ struct DowngradeView: View {
     @State private var failure: downgradefailure? = nil
     @State private var sourcenames: String = ""
     @State private var versionnote: String = ""
+    /// 已有一轮扫描在跑：onAppear / onChange 不能因为 rows 暂时为空就再起一轮
+    @State private var inFlight = false
     @State private var showsources: Bool = false
     @State private var inlinevers: [storeversion] = []
     @State private var loadingvers = false
@@ -217,7 +219,7 @@ struct DowngradeView: View {
         }
         .onAppear {
             refreshsourcenames()
-            if rows.isEmpty { reload() }
+            if rows.isEmpty && !inFlight { reload() }
         }
         .sheet(isPresented: $showsources) {
             NavigationStack {
@@ -232,7 +234,7 @@ struct DowngradeView: View {
         // 沙盒逃逸完成时自动重载：用户常在初始化系统之前就点进本页，
         // 那时读不到目录（日志显示 sbx=false 时 FileManager 被拒）。
         .onChange(of: mgr.sbxready) { ready in
-            if ready && rows.isEmpty {
+            if ready && rows.isEmpty && !inFlight {
                 reload()
             }
         }
@@ -318,14 +320,17 @@ struct DowngradeView: View {
                 : "请先在「内核」页运行漏洞利用并初始化系统。"
             return
         }
+        // 一轮扫描要一两分钟，期间任何一次 push/pop 都会触发 onAppear。
+        // 没有这道闸门就会并发跑好几轮（日志里"解析完成 59/144"重复出现六次）。
+        guard !inFlight else { return }
+        inFlight = true
         loading = true
         errormsg = nil
-        rows = []
         progress = "正在读取已安装应用…"
 
         DispatchQueue.global(qos: .userInitiated).async {
             let bundles = vfsfs.listappbundles()
-            progress = "正在匹配 App Store 信息 0/\(bundles.count)"
+            DispatchQueue.main.async { progress = "正在匹配 App Store 信息 0/\(bundles.count)" }
 
             // 批量解析（一次最多 80 个 bundleId）
             let ids = bundles.map { $0.bundleid }
@@ -349,6 +354,7 @@ struct DowngradeView: View {
 
             DispatchQueue.main.async {
                 loading = false
+                inFlight = false
                 rows = out
                 if out.isEmpty {
                     errormsg = "未能读取已安装应用列表。"

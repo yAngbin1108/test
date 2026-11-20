@@ -383,6 +383,33 @@ final class downgrademgr {
     /// 最近一次版本抓取的说明（多少源有数据、哪些失败），给界面直接显示。
     private(set) var lastversionnote: String = ""
 
+    /// bundleId → App Store 匹配结果缓存。界面重新进入/刷新时只查新增的，
+    /// 不再对 144 个应用重复打 iTunes 接口（那正是被限流的根源）。
+    private var lookupcache: [String: (app: storeapp, at: Date)] = [:]
+    private let lookuplock = NSLock()
+    private let lookupttl: TimeInterval = 10 * 60
+
+    private func cachedapp(_ bundleid: String) -> storeapp? {
+        lookuplock.lock()
+        defer { lookuplock.unlock() }
+        guard let entry = lookupcache[bundleid],
+              Date().timeIntervalSince(entry.at) < lookupttl else { return nil }
+        return entry.app
+    }
+
+    private func cacheapp(_ app: storeapp, for bundleid: String) {
+        lookuplock.lock()
+        lookupcache[bundleid] = (app, Date())
+        lookuplock.unlock()
+    }
+
+    /// 空 trackId 代表"确认查不到"，同样缓存，避免反复请求侧载应用。
+    private func cachenil(_ bundleid: String) {
+        let placeholder = storeapp(trackid: 0, name: bundleid, bundleid: bundleid,
+                                   appiconurl: nil, sellername: nil, version: nil, country: "")
+        cacheapp(placeholder, for: bundleid)
+    }
+
     /// C 层返回码 → 结构化失败。rc 语义见 storekitbridge.describe。
     static func classify(rc: Int32, mode: Int) -> downgradefailure {
         switch Int(rc) {
@@ -504,7 +531,24 @@ final class downgrademgr {
     func resolvebundles(_ bundleids: [String],
                         progress: @escaping (Int, Int) -> Void = { _, _ in }) -> [String: storeapp] {
         var out: [String: storeapp] = [:]
-        let list = bundleids.filter { !$0.isEmpty }
+        let allids = bundleids.filter { !$0.isEmpty }
+        var missing: [String] = []
+        var cached = 0
+        for bid in allids {
+            if let app = cachedapp(bid) {
+                cached += 1
+                if app.trackid != 0 {
+                    out[bid] = app
+                    storekitbridge.shared.pendinglookup[app.trackid] = app
+                }
+            } else {
+                missing.append(bid)
+            }
+        }
+        if cached > 0 {
+            log("匹配缓存命中 \(cached)/\(allids.count)，需要查询 \(missing.count) 个")
+        }
+        let list = missing
         var done = 0
 
         // 并发查询（限 6 路）：138 个应用串行逐个查会耗时数分钟，
@@ -520,6 +564,12 @@ final class downgrademgr {
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { group.leave(); sem.signal() }
                 let app = self.lookupTrackId(bundleid: bid)
+                if let app {
+                    self.cacheapp(app, for: bid)
+                } else {
+                    // 侧载应用查不到商店记录，也要缓存"查不到"，否则每次刷新都白查一遍
+                    self.cachenil(bid)
+                }
                 lock.lock()
                 if let app {
                     out[bid] = app
@@ -532,7 +582,7 @@ final class downgrademgr {
             }
         }
         group.wait()
-        log("解析完成：\(out.count)/\(list.count)")
+        log("解析完成：\(out.count)/\(allids.count)（本次查询 \(list.count) 个）")
         return out
     }
 
