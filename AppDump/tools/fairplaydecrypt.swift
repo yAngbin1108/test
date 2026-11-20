@@ -1252,7 +1252,7 @@ enum FPDecryptor {
         var alignNote = ""
         let kernelPage = UInt64(getpagesize() > 0 ? getpagesize() : 16384)
         if slice.cryptoff % kernelPage != 0 {
-            alignNote = String(format: " · ⚠️ cryptoff 未按 %llu KB 页对齐，改从页首映射重试",
+            alignNote = String(format: " · ⚠️ cryptoff 未按 %llu KB 页对齐，内核会拒绝 FairPlay（这类文件只能走内核砸壳）",
                                kernelPage / 1024)
         }
         return String(format: "%@ · cpu=0x%x/0x%x cryptoff=0x%llx cryptsize=0x%llx cryptid=%u · SC_Info %@%@",
@@ -1291,8 +1291,7 @@ enum FPDecryptor {
         if lower.contains("invalid argument") {
             text += "\n映射参数被拒绝：多半是这个二进制的 cryptoff 不是 16 KB 页对齐，"
                 + "内核只接受页对齐的 mremap_encrypted 地址（日志里带 ⚠️ 的行）。"
-                + "日志中 +slack 表示已从页首重试；仍失败说明这几页本身按别的页大小加密，"
-                + "任何 FairPlay 工具都解不了，只能用 A · 内核砸壳。"
+                + "这类包 FairPlay 路径无解（iPadn 同样卡在这一步），请改用 A · 内核砸壳。"
         }
         return text
     }

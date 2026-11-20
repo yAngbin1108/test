@@ -60,11 +60,15 @@ final class FairPlayJob: ObservableObject {
     @Published private(set) var startedAt: Date? = nil
     /// 用户按了取消、但后台还在把当前文件做完
     @Published private(set) var cancelling = false
+    /// 后台线程卡在某个内核调用里（mremap_encrypted 等不该卡，但真出现过）
+    @Published private(set) var stalled = false
 
     private var token: FPCancelToken?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     // 进度/日志都合批再推给界面：每个 mremap 尝试都会发一行，
     // 一条条 publish 会让 144 行的应用列表每秒重排几百次，主线程直接卡死。
+    private var lastactivity = Date()
+    private var watchdog: Timer?
     private var pendingprogress: (String, Double, String)?
     private var pendinglines: [String] = []
     private var flushscheduled = false
@@ -86,11 +90,33 @@ final class FairPlayJob: ObservableObject {
     }
 
     func cancel() {
-        guard busy, !cancelling else { return }
+        guard busy else { return }
+        if stalled {
+            forceAbandon()
+            return
+        }
+        guard !cancelling else { return }
         cancelling = true
         phase = "正在取消…"
         AppDumpmgr.shared.logmsg("(fairplay) 收到取消请求")
         token?.cancel()
+    }
+
+    /// 放弃卡死的任务：后台线程可能永远回不来，但界面必须能继续用。
+    func forceAbandon() {
+        guard busy else { return }
+        watchdog?.invalidate()
+        watchdog = nil
+        stalled = false
+        cancelling = false
+        runningBundle = nil
+        runningIPA = nil
+        phase = "已结束"
+        errormsg = "上一次任务卡在内核调用里，已强制结束（那个线程可能还在等待，重启 App 可彻底恢复）。"
+        resultText = nil
+        endBackground()
+        endKeepalive()
+        AppDumpmgr.shared.logmsg("(fairplay) 用户强制结束了卡住的任务")
     }
 
     // MARK: - 开始
@@ -157,6 +183,9 @@ final class FairPlayJob: ObservableObject {
     private func prepareRun(bundle: String?, ipa: String?) {
         clearResult()
         cancelling = false
+        stalled = false
+        lastactivity = Date()
+        startWatchdog()
         pendingprogress = nil
         pendinglines.removeAll()
         runningBundle = bundle
@@ -168,12 +197,14 @@ final class FairPlayJob: ObservableObject {
     }
 
     private func applyProgress(_ phase: String, _ fraction: Double, _ detail: String) {
+        lastactivity = Date()
         pendingprogress = (phase, min(max(fraction, 0), 1), detail)
         scheduleFlush()
     }
 
     private func append(_ line: String) {
         DispatchQueue.main.async {
+            self.lastactivity = Date()
             self.pendinglines.append(line)
             self.scheduleFlush()
         }
@@ -206,6 +237,9 @@ final class FairPlayJob: ObservableObject {
 
     private func finish(outcome: FPDecryptor.Outcome) {
         let wasCancelled = cancelling
+        watchdog?.invalidate()
+        watchdog = nil
+        stalled = false
         flushPending()
         cancelling = false
         runningBundle = nil
@@ -235,6 +269,9 @@ final class FairPlayJob: ObservableObject {
     }
 
     private func fail(_ error: Error) {
+        watchdog?.invalidate()
+        watchdog = nil
+        stalled = false
         flushPending()
         cancelling = false
         runningBundle = nil
@@ -265,6 +302,22 @@ final class FairPlayJob: ObservableObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             Task { @MainActor in presentShareSheet(with: url) }
+        }
+    }
+
+    // MARK: - 看门狗
+
+    /// 每 15 秒看一眼：两分钟没有任何进度/日志，基本就是线程卡在内核里了。
+    /// 这时把状态标成 stalled，界面给出「强制结束」，用户不会被永远困住。
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            guard self.busy else { timer.invalidate(); self.watchdog = nil; return }
+            if !self.stalled, Date().timeIntervalSince(self.lastactivity) > 120 {
+                self.stalled = true
+                AppDumpmgr.shared.logmsg("(fairplay) 任务超过 2 分钟没有任何进度，判断为内核调用卡死")
+            }
         }
     }
 

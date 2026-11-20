@@ -122,6 +122,19 @@ struct FairPlayView: View {
                             }
                             .font(.footnote)
                             .disabled(job.cancelling)
+
+                            if job.stalled {
+                                Text("后台线程卡在内核调用里，取消不会生效——只能放弃这次任务。")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Button(role: .destructive) {
+                                    job.forceAbandon()
+                                } label: {
+                                    Text("强制结束任务")
+                                }
+                                .font(.footnote)
+                            }
                         }
                         .padding(.vertical, 2)
                     }

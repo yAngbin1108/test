@@ -47,7 +47,6 @@ typedef struct {
     int mode;
     bool addsigs;
     bool subtype_masked;
-    uint32_t page_slack;   // cryptoff 距页首的偏移（非页对齐包才有）
     int sig_errno;
     int mmap_errno;
     int mremap_ret;
