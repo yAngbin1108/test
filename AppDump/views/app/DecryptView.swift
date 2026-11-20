@@ -226,6 +226,10 @@ struct DecryptView: View {
             if fsready { loadApps() }
             loadIPAs()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .appDumpIPAStoreDidChange)) { _ in
+            // 任何路径（A 内核 / B FairPlay / 提取）写出新 IPA 都即时刷新
+            loadIPAs()
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             if let app = pendingdecrypt {
                 pendingdecrypt = nil
@@ -511,6 +515,9 @@ struct DecryptView: View {
             query = ""
             selectedipas.removeAll()
             ipaEditing = false
+            // 切到 IPA 页就重新扫盘：B 版（FairPlay）产物是后台任务写的，
+            // 以前不切视图就不会刷新，看起来像「刚砸好的应用没出现」。
+            if mode == .ipas { loadIPAs() }
         }
     }
 
@@ -879,6 +886,7 @@ struct DecryptView: View {
                 extractingbid = nil
                 AppDumpmgr.shared.logmsg("(extract) ipa saved to \(ipaPath)")
                 loadIPAs()   // 刷新 IPA 列表
+                NotificationCenter.default.post(name: .appDumpIPAStoreDidChange, object: nil)
                 // 超大 IPA 不要自动弹分享面板：UIActivityViewController 会为
                 // 3GB+ 的归档建预览/拷贝一份，内存瞬间翻倍，直接闪退。
                 let outAttrs = (try? FileManager.default.attributesOfItem(atPath: ipaPath)) ?? [:]
@@ -1094,6 +1102,7 @@ struct DecryptView: View {
                 decryptingbid = nil
                 AppDumpmgr.shared.logmsg("(decrypt) ipa saved to \(ipaPath)")
                 loadIPAs()   // 刷新 IPA 列表
+                NotificationCenter.default.post(name: .appDumpIPAStoreDidChange, object: nil)
                 // 超大 IPA 不要自动弹分享面板：UIActivityViewController 会为
                 // 3GB+ 的归档建预览/拷贝一份，内存瞬间翻倍，直接闪退。
                 let outAttrs = (try? FileManager.default.attributesOfItem(atPath: ipaPath)) ?? [:]

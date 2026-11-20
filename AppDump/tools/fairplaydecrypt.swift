@@ -731,10 +731,18 @@ enum FPStage {
         return nil
     }
 
-    /// 崩溃残留的 fpwork-* 清理。
+    /// 崩溃残留的 fpwork-* 清理。必须覆盖 App Group 容器，否则真实暂存目录里的
+    /// 垃圾永远清不掉；调用方要保证此刻没有任务在跑。
     static func cleanupStaleWork() {
         let manager = FileManager.default
-        for root in [documents, Bundle.main.bundleURL.appendingPathComponent("fpstage", isDirectory: true)] {
+        var roots: [URL] = [documents,
+                            Bundle.main.bundleURL.appendingPathComponent("fpstage", isDirectory: true)]
+        for group in groupIdentifiers() {
+            if let url = manager.containerURL(forSecurityApplicationGroupIdentifier: group) {
+                roots.append(url)
+            }
+        }
+        for root in roots {
             guard let items = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { continue }
             for item in items where item.lastPathComponent.hasPrefix("fpwork-") {
                 try? manager.removeItem(at: item)

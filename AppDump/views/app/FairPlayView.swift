@@ -12,23 +12,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-final class FPCancelToken {
-    private let lock = NSLock()
-    private var flag = false
-
-    var cancelled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return flag
-    }
-
-    func cancel() {
-        lock.lock()
-        flag = true
-        lock.unlock()
-    }
-}
-
 struct FPSourceIPA: Identifiable {
     let id = UUID()
     let name: String
@@ -42,22 +25,17 @@ struct FairPlayView: View {
     let installedApps: [DecryptApp]
 
     @ObservedObject private var mgr = AppDumpmgr.shared
+    /// 运行中的任务属于这个单例，不随视图销毁（离开页面也不会丢进度/结果）。
+    @ObservedObject private var job = FairPlayJob.shared
     @State private var ipas: [FPSourceIPA] = []
-    @State private var running: String? = nil
-    @State private var phase = ""
-    @State private var fraction: Double = 0
-    @State private var detail = ""
-    @State private var lines: [String] = []
-    @State private var errormsg: String? = nil
-    @State private var resultText: String? = nil
     @State private var importing = false
     @State private var showEnv = false
     @State private var envLines: [String] = []
-    @State private var token = FPCancelToken()
     @State private var query = ""
     @State private var confirming: FPSourceIPA? = nil
     @State private var installedPending: DecryptApp? = nil
-    @State private var runningBundle: String? = nil
+    /// 只有「导入 IPA」这种视图内动作的错误
+    @State private var localerror: String? = nil
 
     @AppStorage("fpAllowBundleStage") private var allowBundleStage: Bool = true
 
@@ -65,7 +43,7 @@ struct FairPlayView: View {
         NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? ""
     }
 
-    private var busy: Bool { running != nil || runningBundle != nil }
+    private var busy: Bool { job.busy }
 
     private var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -116,29 +94,29 @@ struct FairPlayView: View {
                 }
             }
 
-            if let errormsg {
+            if let message = job.errormsg ?? localerror {
                 Section {
                     PlainAlert(title: "解密失败", icon: "exclamationmark.triangle.fill",
-                               text: errormsg, color: .red)
+                               text: message, color: .red)
                 }
             }
 
-            if busy || resultText != nil {
+            if busy || job.resultText != nil {
                 Section {
                     if busy {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 8) {
                                 ProgressView()
-                                Text(phase.isEmpty ? "准备中…" : phase)
+                                Text(job.phase.isEmpty ? "准备中…" : job.phase)
                                     .font(.subheadline.weight(.medium))
                             }
-                            ProgressView(value: min(max(fraction, 0), 1))
-                            Text(detail)
+                            ProgressView(value: min(max(job.fraction, 0), 1))
+                            Text(job.detail)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                             Button(role: .destructive) {
-                                token.cancel()
+                                job.cancel()
                             } label: {
                                 Text("取消")
                             }
@@ -146,14 +124,30 @@ struct FairPlayView: View {
                         }
                         .padding(.vertical, 2)
                     }
-                    if let resultText {
+                    if let resultText = job.resultText {
                         Text(resultText)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            if let path = job.outputPath {
+                                Button {
+                                    presentShareSheet(with: URL(fileURLWithPath: path))
+                                } label: {
+                                    Label("分享", systemImage: "square.and.arrow.up")
+                                        .font(.footnote)
+                                }
+                            }
+                            Button(role: .destructive) {
+                                job.clearResult()
+                            } label: {
+                                Text("清除结果")
+                                    .font(.footnote)
+                            }
+                        }
                     }
-                    if !lines.isEmpty {
+                    if !job.lines.isEmpty {
                         // 只显示尾部，完整日志在「日志」页
-                        ForEach(Array(lines.suffix(10).enumerated()), id: \.offset) { _, line in
+                        ForEach(Array(job.lines.suffix(10).enumerated()), id: \.offset) { _, line in
                             Text(line)
                                 .font(.caption2.monospaced())
                                 .foregroundStyle(.secondary)
@@ -162,6 +156,10 @@ struct FairPlayView: View {
                     }
                 } header: {
                     HeaderLabel(text: "FairPlay 解密", icon: "lock.open")
+                } footer: {
+                    if busy {
+                        Text("任务在后台独立运行，离开本页也不会中断；回来还能看到进度和结果。")
+                    }
                 }
             }
 
@@ -224,7 +222,7 @@ struct FairPlayView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                if runningBundle == app.bundlePath {
+                                if job.runningBundle == app.bundlePath {
                                     ProgressView()
                                 } else {
                                     Image(systemName: "play.circle.fill")
@@ -279,7 +277,7 @@ struct FairPlayView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                if running == ipa.path {
+                                if job.runningIPA == ipa.path {
                                     ProgressView()
                                 } else {
                                     Image(systemName: "play.circle.fill")
@@ -304,7 +302,8 @@ struct FairPlayView: View {
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .onAppear {
-            FPStage.cleanupStaleWork()
+            // 有任务在跑时绝不能清理：fpwork-* 可能正是它的暂存目录。
+            if !job.busy { FPStage.cleanupStaleWork() }
             loadIPAs()
         }
         .fileImporter(isPresented: $importing,
@@ -346,7 +345,7 @@ struct FairPlayView: View {
             titleVisibility: .visible
         ) {
             if let app = installedPending {
-                Button("开始解密") { startInstalled(app) }
+                Button("开始解密") { job.startInstalled(app, allowBundleStaging: allowBundleStage) }
                 Button("取消", role: .cancel) {}
             }
         }
@@ -356,7 +355,7 @@ struct FairPlayView: View {
             titleVisibility: .visible
         ) {
             if let ipa = confirming {
-                Button("开始解密") { start(ipa) }
+                Button("开始解密") { job.startIPA(path: ipa.path, allowBundleStaging: allowBundleStage) }
                 Button("取消", role: .cancel) {}
             }
         }
@@ -404,152 +403,13 @@ struct FairPlayView: View {
                 AppDumpmgr.shared.logmsg("(fairplay) 导入 \(source.lastPathComponent)")
                 loadIPAs()
             } catch {
-                errormsg = "导入失败：\(error.localizedDescription)"
+                localerror = "导入失败：\(error.localizedDescription)"
             }
         case .failure(let error):
-            errormsg = "导入失败：\(error.localizedDescription)"
+            localerror = "导入失败：\(error.localizedDescription)"
         }
     }
 
-    // MARK: - 执行
-
-    /// 已安装应用：先整包拷到暂存目录，再走同一条 FairPlay 流水线。
-    private func startInstalled(_ app: DecryptApp) {
-        guard !busy else { return }
-        errormsg = nil
-        resultText = nil
-        lines.removeAll()
-        phase = "准备中"
-        fraction = 0
-        detail = app.bundlePath
-        runningBundle = app.bundlePath
-
-        let token = FPCancelToken()
-        self.token = token
-        let allowBundle = allowBundleStage
-        let bundlePath = app.bundlePath
-        let appName = app.name
-
-        AppDumpmgr.shared.logmsg("(fairplay) 直砸已安装应用 \(app.bundleID)")
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let outcome = try FPDecryptor.decryptInstalledApp(
-                    bundlePath: bundlePath,
-                    appName: appName,
-                    allowBundleStaging: allowBundle,
-                    isCancelled: { token.cancelled },
-                    progress: { phase, fraction, detail in
-                        DispatchQueue.main.async {
-                            self.phase = phase
-                            self.fraction = fraction
-                            self.detail = detail
-                        }
-                    },
-                    copyBundle: { destination in
-                        FairPlayCopy.run(from: bundlePath, to: destination.path)
-                    },
-                    log: { line in
-                        DispatchQueue.main.async {
-                            self.lines.append(line)
-                            if self.lines.count > 300 {
-                                self.lines.removeFirst(self.lines.count - 300)
-                            }
-                        }
-                        AppDumpmgr.shared.logmsg("(fairplay) \(line)")
-                    })
-
-                DispatchQueue.main.async {
-                    self.runningBundle = nil
-                    let seconds = String(format: "%.0f", outcome.elapsed)
-                    self.resultText = "\(outcome.clean ? "解密完成" : "部分完成")：解密 \(outcome.decrypted) / 明文 \(outcome.plain) / 失败 \(outcome.failed)，"
-                        + "Mach-O \(outcome.machO) 个，耗时 \(seconds) 秒。\n"
-                        + "校验：\(outcome.verifySummary)\n"
-                        + "产物：\(outcome.output.lastPathComponent)"
-                    if !outcome.clean {
-                        self.errormsg = outcome.failed > 0
-                            ? "有 \(outcome.failed) 个文件没解开，产物带 PARTIAL 标记。"
-                            : "产物校验未通过，请检查日志。"
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.runningBundle = nil
-                    if let fpError = error as? FPError, case .cancelled = fpError {
-                        self.resultText = "已取消。"
-                    } else {
-                        self.errormsg = error.localizedDescription
-                    }
-                    AppDumpmgr.shared.logmsg("(fairplay) 失败：\(error.localizedDescription)")
-                }
-            }
-        }
-    }
-
-    private func start(_ ipa: FPSourceIPA) {
-        guard running == nil else { return }
-        errormsg = nil
-        resultText = nil
-        lines.removeAll()
-        phase = "准备中"
-        fraction = 0
-        detail = ""
-        running = ipa.path
-
-        let token = FPCancelToken()
-        self.token = token
-        let allowBundle = allowBundleStage
-
-        AppDumpmgr.shared.logmsg("(fairplay) 开始解密 \(ipa.name)，暂存开关=\(allowBundle ? "允许" : "禁用")")
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let outcome = try FPDecryptor.decrypt(
-                    ipa: URL(fileURLWithPath: ipa.path),
-                    allowBundleStaging: allowBundle,
-                    isCancelled: { token.cancelled },
-                    progress: { phase, fraction, detail in
-                        DispatchQueue.main.async {
-                            self.phase = phase
-                            self.fraction = fraction
-                            self.detail = detail
-                        }
-                    },
-                    log: { line in
-                        DispatchQueue.main.async {
-                            self.lines.append(line)
-                            if self.lines.count > 300 {
-                                self.lines.removeFirst(self.lines.count - 300)
-                            }
-                        }
-                        AppDumpmgr.shared.logmsg("(fairplay) \(line)")
-                    })
-                DispatchQueue.main.async {
-                    self.running = nil
-                    let seconds = String(format: "%.0f", outcome.elapsed)
-                    self.resultText = "\(outcome.clean ? "解密完成" : "部分完成")：解密 \(outcome.decrypted) / 明文 \(outcome.plain) / 失败 \(outcome.failed)，"
-                        + "Mach-O \(outcome.machO) 个，耗时 \(seconds) 秒。\n"
-                        + "校验：\(outcome.verifySummary)\n"
-                        + "产物：\(outcome.output.lastPathComponent)"
-                    if !outcome.clean {
-                        self.errormsg = outcome.failed > 0
-                            ? "有 \(outcome.failed) 个文件没解开，产物带 PARTIAL 标记。"
-                            : "产物校验未通过，请检查日志。"
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.running = nil
-                    if let fpError = error as? FPError, case .cancelled = fpError {
-                        self.resultText = "已取消。"
-                    } else {
-                        self.errormsg = error.localizedDescription
-                    }
-                    AppDumpmgr.shared.logmsg("(fairplay) 失败：\(error.localizedDescription)")
-                }
-            }
-        }
-    }
 }
 // MARK: - 应用包拷贝
 
