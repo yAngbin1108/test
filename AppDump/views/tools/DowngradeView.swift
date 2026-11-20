@@ -38,6 +38,8 @@ struct DowngradeView: View {
     @State private var showsources: Bool = false
     @State private var inlinevers: [storeversion] = []
     @State private var loadingvers = false
+    /// inlinevers 属于哪个 trackId；换了应用才清空，同应用刷新失败时保留旧列表
+    @State private var inlinevers_tid: Int64 = 0
 
 
     enum RowFilter: String, CaseIterable {
@@ -369,7 +371,13 @@ struct DowngradeView: View {
 
     /// 加载某应用的版本列表（内联展开用）
     private func loadversions(for tid: Int64) {
-        inlinevers = []
+        // 换应用才清空；同一个应用重试失败时保留上一份列表，
+        // 不能让一次网络抖动把整页清成「没有拿到历史版本」——
+        // 那样用户会以为降级失败或没生效（之前就是这样把提交成功的状态盖掉的）。
+        if tid != inlinevers_tid {
+            inlinevers = []
+            inlinevers_tid = tid
+        }
         loadingvers = true
         AppDumpmgr.shared.logmsg("(downgrade) 内联加载版本 tid=\(tid)")
         versionnote = ""
@@ -378,13 +386,15 @@ struct DowngradeView: View {
             let list = downgrademgr.shared.history(trackid: tid)
             let note = downgrademgr.shared.lastversionnote
             DispatchQueue.main.async {
-                inlinevers = list
+                if !list.isEmpty {
+                    inlinevers = list
+                }
                 versionnote = note
                 loadingvers = false
-                if list.isEmpty {
+                if inlinevers.isEmpty {
                     failure = downgrademgr.classifyempty(note: note)
                 }
-                AppDumpmgr.shared.logmsg("(downgrade) 内联版本数=\(list.count)")
+                AppDumpmgr.shared.logmsg("(downgrade) 内联版本数=\(list.count)（沿用=\(inlinevers.count)）")
             }
         }
     }
@@ -469,6 +479,8 @@ struct DowngradeView: View {
                 downgrademgr.shared.downgrade(trackid: store.trackid, version: v) { result in
                     switch result {
                     case .success:
+                        // 提交成功后给一句可见反馈：之前只有日志，用户以为"没动静"。
+                        versionnote = "已向 App Store 提交下载请求（\(v.displayline)）。回到桌面看图标上的下载进度；没反应就去 App Store「已购项目」里点一次「更新」。"
                         AppDumpmgr.shared.logmsg("(downgrade) 降级请求已提交：\(item.name) -> \(v.displayline)")
                     case .failure(let e):
                         AppDumpmgr.shared.logmsg("(downgrade) 降级失败：\(e.reason)")

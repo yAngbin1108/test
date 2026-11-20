@@ -280,19 +280,24 @@ final class storekitbridge {
             return .failure(.storeKitUnavailable("内核读写未就绪，请先运行漏洞利用"))
         }
 
-        // 取该 trackId 对应的 lookup 原始字典（SKUIItem 构造所需）
+        // 取该 trackId 对应的 iTunes lookup 原始条目，序列化后交给注入代码当
+        // SKUIItem 的 lookup 字典。缺了它，item 里的 itemIdentifier / bundleId 都是 0，
+        // 商店收到购买请求后既不报错也不下载。
         let app = storekitbridge.shared.pendinglookup[trackid]
-        // ObjC 的 NSDictionary* 会被 Swift 桥接成 [AnyHashable: Any]?
-        let dict: [AnyHashable: Any]? = app?.lookupitem
-        if dict == nil {
-            AppDumpmgr.shared.logmsg("(downgrade) 警告：缺少 lookup 字典，SKUIItem 可能构造失败")
+        var lookupjson = ""
+        if let item = app?.lookupitem,
+           let data = try? JSONSerialization.data(withJSONObject: item),
+           let text = String(data: data, encoding: .utf8) {
+            lookupjson = text
+            AppDumpmgr.shared.logmsg("(downgrade) lookup 条目已就绪（\(data.count) 字节）")
+        } else {
+            AppDumpmgr.shared.logmsg("(downgrade) 警告：缺少 lookup 条目，改用兜底字典")
         }
 
         // 只有注入 SpringBoard 一条路（本进程模式已移除）。
-        let bundleid = app?.bundleid ?? ""
         AppDumpmgr.shared.logmsg("(downgrade) 使用模式 B（注入 SpringBoard）")
 
-        let rc = kcd_perform_downgrade_mode(trackid, versionid, bundleid, 1)
+        let rc = kcd_perform_downgrade_withlookup(trackid, versionid, lookupjson)
         if rc == 0 {
             AppDumpmgr.shared.logmsg("(downgrade) 购买请求已提交，请回到桌面查看下载")
             return .success(())
@@ -706,6 +711,13 @@ final class downgrademgr {
         if !versions.isEmpty {
             cache[cachekey] = cacheentry(savedAt: Date(), complete: complete, versions: versions)
             savecache(cache)
+        } else if let old = cache[cachekey], !old.versions.isEmpty {
+            // 这次所有来源都失败，但之前抓到过：宁可给过期数据 + 说明，
+            // 也不要把列表清空（清空后界面看起来像"降级没生效"）。
+            let mins = Int(Date().timeIntervalSince(old.savedAt) / 60)
+            return fetchresult(versions: old.versions,
+                               note: "历史版本 \(old.versions.count) 个（离线缓存，\(mins) 分钟前）",
+                               complete: old.complete)
         }
 
         var note = "历史版本 \(versions.count) 个（\(results.count - failed.count)/\(sources.count) 个来源有数据）"
