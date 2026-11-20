@@ -205,8 +205,8 @@ enum downgradeerror: LocalizedError {
     case noVersions
     case storeKitUnavailable(String)
     case failed(String)
-    /// C 层的原始返回码 + 使用的模式，用于结构化分类
-    case coded(Int32, Int)
+    /// C 层的原始返回码，用于结构化分类
+    case coded(Int32)
 
     var errorDescription: String? {
         switch self {
@@ -214,7 +214,7 @@ enum downgradeerror: LocalizedError {
         case .noVersions: return "没有可用的历史版本"
         case .storeKitUnavailable(let w): return "StoreKit 私有接口不可用（\(w)）"
         case .failed(let m): return "降级失败：\(m)"
-        case .coded(let rc, let mode): return downgrademgr.describe(rc: rc, mode: mode)
+        case .coded(let rc): return downgrademgr.describe(rc: rc)
         }
     }
 }
@@ -288,16 +288,16 @@ final class storekitbridge {
             AppDumpmgr.shared.logmsg("(downgrade) 警告：缺少 lookup 字典，SKUIItem 可能构造失败")
         }
 
-        let mode = downgrademgr.currentMode
+        // 只有注入 SpringBoard 一条路（本进程模式已移除）。
         let bundleid = app?.bundleid ?? ""
-        AppDumpmgr.shared.logmsg("(downgrade) 使用\(mode == 0 ? "模式 A（本进程）" : "模式 B（注入 SpringBoard）")")
+        AppDumpmgr.shared.logmsg("(downgrade) 使用模式 B（注入 SpringBoard）")
 
-        let rc = kcd_perform_downgrade_mode(trackid, versionid, bundleid, Int32(mode))
+        let rc = kcd_perform_downgrade_mode(trackid, versionid, bundleid, 1)
         if rc == 0 {
             AppDumpmgr.shared.logmsg("(downgrade) 购买请求已提交，请回到桌面查看下载")
             return .success(())
         }
-        return .failure(.coded(rc, mode))
+        return .failure(.coded(rc))
     }
 
     /// KVC 写入，失败不抛异常（字段名随系统版本变化）
@@ -411,32 +411,28 @@ final class downgrademgr {
     }
 
     /// C 层返回码 → 结构化失败。rc 语义见 storekitbridge.describe。
-    static func classify(rc: Int32, mode: Int) -> downgradefailure {
+    static func classify(rc: Int32) -> downgradefailure {
         switch Int(rc) {
         case 2:
             return downgradefailure(kind: .noversions, title: "版本号无效",
                                     reason: "选中的版本 ID 没能通过校验。",
                                     advice: "换一个版本再试；如果版本来源里出现「未知版本」，先到「版本来源」里换一个能给出正确版本号的源。")
-        case 10:
-            return downgradefailure(kind: .notpurchased, title: "商店拒绝了这个请求",
-                                    reason: "本进程与 App Store Daemon 都没能提交这次降级请求。最常见的原因是：当前 Apple ID 没有这个应用的下载记录。",
-                                    advice: "先在系统「App Store」里正常下载一次该应用（免费应用也要点一次获取），确认账号有记录后再回来降级；或者改用模式 B（需要先在「内核」页初始化系统）。")
         case 20:
             return downgradefailure(kind: .kernel, title: "无法附着 SpringBoard",
                                     reason: "模式 B 需要把代码注入 SpringBoard 才能复用商店的购买流程。",
-                                    advice: "到「内核」页运行漏洞利用并初始化系统，然后重试；或者把「降级方式」切回「本进程」（模式 A）。")
+                                    advice: "到「内核」页运行漏洞利用并初始化系统，然后重试。")
         case 21, 22, 23:
             return downgradefailure(kind: .storekit, title: "SpringBoard 里加载 StoreKitUI 失败",
                                     reason: "目标进程里没能取到 SKUIClientContext / SKUIItem 这些私有类。",
-                                    advice: "换用模式 A 再试一次；两个模式都失败说明该系统的 StoreKitUI 结构变了，只能等适配。")
+                                    advice: "重试一次；仍失败说明该系统的 StoreKitUI 结构变了，只能等适配。")
         case 24, 25, 26:
             return downgradefailure(kind: .storekit, title: "构造购买请求失败",
                                     reason: "SKUIItemOffer / SKUIItemStateCenter 没能构造出可用的请求对象。",
-                                    advice: "重试一次；仍失败就用模式 A，或换一个更早的版本号试试（个别版本 ID 已被苹果下架）。")
+                                    advice: "重试一次，或换一个更早的版本号试试（个别版本 ID 已被苹果下架）。")
         case 27:
             return downgradefailure(kind: .kernel, title: "内核读写未就绪",
                                     reason: "模式 B 需要内核读写才能把参数写进目标进程。",
-                                    advice: "到「内核」页初始化系统后重试，或切回模式 A。")
+                                    advice: "到「内核」页初始化系统后重试。")
         case 98:
             return downgradefailure(kind: .timeout, title: "注入执行超时",
                                     reason: "目标进程长时间没有返回。",
@@ -444,11 +440,11 @@ final class downgrademgr {
         case 99:
             return downgradefailure(kind: .other, title: "执行过程抛出异常",
                                     reason: "注入的代码在目标进程里异常退出。",
-                                    advice: "重试，或改用另一个模式；日志里有完整堆栈。")
+                                    advice: "重试一次；日志里有完整堆栈。")
         default:
             return downgradefailure(kind: .other, title: "降级失败",
-                                    reason: "错误码 \(rc)（模式 \(mode == 0 ? "A" : "B")）。",
-                                    advice: "查看日志里的完整输出；两个模式各试一次可以区分是商店侧还是注入侧的问题。")
+                                    reason: "错误码 \(rc)（注入 SpringBoard）。",
+                                    advice: "查看日志里的完整输出。")
         }
     }
 
@@ -464,36 +460,23 @@ final class downgrademgr {
                                 advice: "检查网络后重试；如果只是某个来源失败，可以到「版本来源」里换一个能用的接口。")
     }
 
-    /// 降级实现方式。两条路径完全独立，不会混合执行。
-    ///   0 = 本进程（AppRetro 做法，不需要漏洞利用）
-    ///   1 = 注入 SpringBoard（Cyanide 做法，需要内核读写就绪）
-    static let modeKey = "AppDump.downgradeMode"
-
-    static var currentMode: Int {
-        get { UserDefaults.standard.object(forKey: modeKey) == nil
-                ? 1                                   // 默认沿用已验证的注入模式
-                : UserDefaults.standard.integer(forKey: modeKey) }
-        set { UserDefaults.standard.set(newValue, forKey: modeKey) }
-    }
-
     private init() {}
 
 
-    /// 把 C 层返回码翻译成可读信息。10~1x 属模式 A，20~2x 属模式 B。
-    static func describe(rc: Int32, mode: Int) -> String {
+    /// 把 C 层返回码翻译成可读信息。
+    static func describe(rc: Int32) -> String {
         switch Int(rc) {
         case 2:  return "版本号无效"
-        case 10: return "模式 A 失败：AppStoreDaemon 与本进程 StoreKitUI 都没成功。可改用模式 B（需先运行漏洞利用）。"
-        case 20: return "无法附着 SpringBoard，请先在「内核」页运行漏洞利用并初始化系统，或改用模式 A。"
+        case 20: return "无法附着 SpringBoard，请先在「内核」页运行漏洞利用并初始化系统。"
         case 21, 22: return "SpringBoard 内加载 StoreKitUI 失败"
         case 23: return "SpringBoard 内缺少 SKUI 类"
         case 24: return "SKUIItemOffer / SKUIItem 构造失败"
         case 25: return "SKUIItemStateCenter 不可用"
         case 26: return "购买项构造失败"
-        case 27: return "内核读写未就绪，请先运行漏洞利用，或改用模式 A"
+        case 27: return "内核读写未就绪，请先运行漏洞利用"
         case 98: return "注入执行超时"
         case 99: return "执行过程抛出异常（详见日志）"
-        default: return "失败（错误码 \(rc)，模式 \(mode == 0 ? "A" : "B")）"
+        default: return "失败（错误码 \(rc)，注入 SpringBoard）"
         }
     }
 
@@ -822,19 +805,19 @@ final class downgrademgr {
         guard let e = error as? downgradeerror else {
             return downgradefailure(kind: .other, title: "降级失败",
                                     reason: error.localizedDescription,
-                                    advice: "查看日志；两个模式各试一次可以区分是商店侧还是注入侧的问题。")
+                                    advice: "查看日志里的完整输出。")
         }
         switch e {
-        case .coded(let rc, let mode):
-            return classify(rc: rc, mode: mode)
+        case .coded(let rc):
+            return classify(rc: rc)
         case .storeKitUnavailable(let message):
             let kernelRelated = message.contains("内核") || message.contains("漏洞")
             return downgradefailure(kind: kernelRelated ? .kernel : .storekit,
                                     title: kernelRelated ? "内核读写未就绪" : "StoreKit 私有接口不可用",
                                     reason: message,
                                     advice: kernelRelated
-                                        ? "到「内核」页运行漏洞利用并初始化系统后重试，或把「降级方式」切回「本进程」。"
-                                        : "该系统的 StoreKitUI 结构可能变了；先用「本进程」模式再试一次。")
+                                        ? "到「内核」页运行漏洞利用并初始化系统后重试。"
+                                        : "该系统的 StoreKitUI 结构与预期不一致，重试一次；仍失败只能等适配。")
         case .noVersions:
             return downgradefailure(kind: .noversions, title: "没有可用的历史版本",
                                     reason: "这个应用一个历史版本都没查到。",
@@ -846,7 +829,7 @@ final class downgrademgr {
         case .failed(let message):
             return downgradefailure(kind: .other, title: "降级失败",
                                     reason: message,
-                                    advice: "查看日志里的完整输出；两个模式各试一次可以区分是商店侧还是注入侧的问题。")
+                                    advice: "查看日志里的完整输出。")
         }
     }
 }

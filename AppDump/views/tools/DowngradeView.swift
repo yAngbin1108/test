@@ -29,7 +29,6 @@ struct DowngradeView: View {
     @State private var loading = false
     @State private var progress = ""
     @State private var errormsg: String? = nil
-    @AppStorage(downgrademgr.modeKey) private var dgMode: Int = 1
     @State private var expanded: String? = nil
     @State private var failure: downgradefailure? = nil
     @State private var sourcenames: String = ""
@@ -133,17 +132,6 @@ struct DowngradeView: View {
                         .buttonStyle(.plain)
                     }
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("降级方式").font(.footnote.weight(.semibold))
-                    Picker("", selection: $dgMode) {
-                        Text("本进程").tag(0 as Int)
-                        Text("注入 SpringBoard").tag(1 as Int)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                }
-                .padding(.vertical, 2)
-
                 Picker("", selection: $filter) {
                     ForEach(RowFilter.allCases, id: \.self) { f in
                         Text(f.rawValue).tag(f)
