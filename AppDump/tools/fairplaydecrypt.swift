@@ -1156,7 +1156,9 @@ enum FPDecryptor {
         log("打包前：Mach-O \(after.count) 个，仍加密切片 \(stillEncrypted) 个")
 
         guard decrypted > 0 else {
-            throw FPError.refused(diagnose(firstFailure: firstFailure, failed: failed, stillEncrypted: stillEncrypted))
+            throw FPError.refused(diagnose(firstFailure: firstFailure, failed: failed,
+                                          stillEncrypted: stillEncrypted,
+                                          fromInstalledApp: originalAppDir != nil))
         }
         if isCancelled() { throw FPError.cancelled }
 
@@ -1268,7 +1270,8 @@ enum FPDecryptor {
 
     /// 把 C 层的失败行翻成能照做的建议。最常见的其实是"这台设备没有该账号的
     /// 解密授权"：用哪个账号下载的，就得让那个账号在系统 App Store 登录一次。
-    private static func diagnose(firstFailure: String?, failed: Int, stillEncrypted: Int) -> String {
+    private static func diagnose(firstFailure: String?, failed: Int, stillEncrypted: Int,
+                                 fromInstalledApp: Bool) -> String {
         var text = "\(failed) 个文件失败，\(stillEncrypted) 个切片仍加密。"
         guard let raw = firstFailure?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
             return text
@@ -1289,9 +1292,20 @@ enum FPDecryptor {
         }
         text += "\n内核返回：\(raw)"
         if lower.contains("invalid argument") {
-            text += "\n映射参数被拒绝：多半是这个二进制的 cryptoff 不是 16 KB 页对齐，"
-                + "内核只接受页对齐的 mremap_encrypted 地址（日志里带 ⚠️ 的行）。"
-                + "这类包 FairPlay 路径无解（iPadn 同样卡在这一步），请改用 A · 内核砸壳。"
+            if fromInstalledApp {
+                // 已安装的包经常是别人重签/重打包过的：主二进制可能只剩一个 4 KB
+                // 的「加密标记页」，cryptoff 也不按 16 KB 对齐，fairplayd 直接拒。
+                // 而下载来的官方 IPA 是 16 KB 对齐、页数完整的，同一个内核路径能过。
+                text += "\n映射参数被拒绝：cryptoff 不是 16 KB 页对齐（日志里带 ⚠️ 的行）。"
+                    + "\n这份「已安装应用」多半被别人重签/重打包过（主二进制只有 1 个加密页，"
+                    + "而官方包是上万页），这种包 fairplayd 一律拒绝。"
+                    + "\n请改用上面的「导入加密 IPA」：导入从 App Store 下载的原始 IPA 再解，"
+                    + "这才是 iPadn 的做法，页对齐和授权都能对上。"
+            } else {
+                text += "\n映射参数被拒绝：这个 IPA 里的二进制 cryptoff 不是 16 KB 页对齐"
+                    + "（日志里带 ⚠️ 的行），内核只接受页对齐的 mremap_encrypted 地址。"
+                    + "这类包 FairPlay 路径无解（iPadn 同样卡在这一步），请改用 A · 内核砸壳。"
+            }
         }
         return text
     }
