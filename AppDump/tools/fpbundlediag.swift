@@ -30,12 +30,31 @@ enum FPBundleAudit {
         }
 
         // 2. iTunes 元数据
-        let meta = appDir.appendingPathComponent("iTunesMetadata.plist")
-        if let attrs = try? manager.attributesOfItem(atPath: meta.path),
-           let size = attrs[.size] as? NSNumber {
-            log("（体检）iTunesMetadata.plist：有（\(size.intValue) B）")
+        // iOS 17 起商店把 iTunesMetadata.plist 写在**容器目录**（.app 的父目录）里，
+        // 老版本才放在 .app 内。只看包内会把正常包误判成「元数据被删」。
+        let container = appDir.deletingLastPathComponent()
+        var metaHits: [String] = []
+        for candidate in [appDir.appendingPathComponent("iTunesMetadata.plist"),
+                          container.appendingPathComponent("iTunesMetadata.plist")] {
+            guard let attrs = try? manager.attributesOfItem(atPath: candidate.path),
+                  let size = attrs[.size] as? NSNumber else { continue }
+            let place = candidate.deletingLastPathComponent() == appDir ? "包内" : "容器目录"
+            metaHits.append("\(place) \(size.intValue) B")
+        }
+        if metaHits.isEmpty {
+            log("（体检）iTunesMetadata.plist：包内与容器目录都没有（商店包一般有，重签/改壳常被删）")
         } else {
-            log("（体检）iTunesMetadata.plist：无（商店原包一般有，重签/改壳常被删）")
+            log("（体检）iTunesMetadata.plist：有（" + metaHits.joined(separator: "、") + "）")
+        }
+        var containerMarks: [String] = []
+        for name in ["BundleMetadata.plist", ".com.apple.mobile_container_manager.metadata.plist"] {
+            if manager.fileExists(atPath: container.appendingPathComponent(name).path) {
+                containerMarks.append(name)
+            }
+        }
+        if !containerMarks.isEmpty {
+            log("（体检）容器元数据：有（" + containerMarks.joined(separator: "、") + "）"
+                + " ⇒ 这个容器是 installd 建的（不是手工拷进来的目录）")
         }
 
         // 2b. 时间线：区分「拷进设备时就是这样」和「装完之后被改的」
@@ -62,6 +81,7 @@ enum FPBundleAudit {
             return
         }
         log("（体检）主程序签名：\(facts.signatureText)")
+        log("（体检）签名结构：\(facts.signatureStructure)")
 
         // 5. 加密区占比 + 正文抽样
         guard let slice = rows.first(where: { $0.path == exeName })?.slices.first else {
@@ -145,6 +165,47 @@ enum FPBundleAudit {
         var csFlags: UInt32 = 0
         var team: String?
         var hasCodeDirectory = false
+        // 签名结构的原始事实：LC_CODE_SIGNATURE 有没有、指向哪、superblob 里有什么。
+        // 只说「没有 CodeDirectory」用户没法复核，把数字摊开才算证据。
+        var hasCSCommand = false
+        var csOffset: UInt64 = 0
+        var csSize: UInt64 = 0
+        var superblobMagic: UInt32?
+        var blobTypes: [UInt32] = []
+
+        private static func blobName(_ type: UInt32) -> String {
+            switch type {
+            case 0: return "CodeDirectory"
+            case 1: return "Requirements"
+            case 2: return "Entitlements"
+            case 3: return "ResourceDir"
+            case 4: return "Application"
+            case 5: return "EntitlementsDER"
+            case 7: return "LaunchConstraint"
+            case 0x1000: return "分析槽"
+            default: return "\(type)"
+            }
+        }
+
+        var signatureStructure: String {
+            guard hasCSCommand else {
+                return "没有 LC_CODE_SIGNATURE 命令 ⇒ 整段签名（含 CodeDirectory）被删掉了"
+            }
+            var text = String(format: "LC_CODE_SIGNATURE off=0x%llx size=0x%llx", csOffset, csSize)
+            if csSize == 0 { return text + "，size=0（空签名）" }
+            if let magic = superblobMagic, magic == 0xFADE_0CC0 || magic == 0xFADE_0CC1 {
+                text += String(format: " · superblob 0x%x，%d 个 blob", magic, blobTypes.count)
+                if !blobTypes.isEmpty {
+                    text += "（" + blobTypes.prefix(8).map { Self.blobName($0) }.joined(separator: "、") + "）"
+                }
+            } else if let magic = superblobMagic {
+                text += String(format: " · blob 魔数 0x%x 不是 embedded-signature superblob", magic)
+            } else {
+                text += " · blob 读不到（csSize 太小或越界）"
+            }
+            text += hasCodeDirectory ? " · 有 CodeDirectory" : " · 没有 CodeDirectory"
+            return text
+        }
 
         var isAdHoc: Bool { hasCodeDirectory && (csFlags & 0x2) != 0 }
 
@@ -263,6 +324,9 @@ enum FPBundleAudit {
                 if let dataoff = u32(cmds, position + 8), let datasize = u32(cmds, position + 12) {
                     csOffset = sliceOff + UInt64(dataoff)
                     csSize = UInt64(datasize)
+                    facts.hasCSCommand = true
+                    facts.csOffset = sliceOff + UInt64(dataoff)
+                    facts.csSize = UInt64(datasize)
                 }
             }
             position += Int(cmdsize)
@@ -270,10 +334,12 @@ enum FPBundleAudit {
 
         if let csOffset, csSize > 12, let blob = readAt(handle, csOffset, Int(min(csSize, 128 * 1024))) {
             if let magicSb = u32(blob, 0), magicSb == 0xFADE_0CC0 || magicSb == 0xFADE_0CC1 {
+                facts.superblobMagic = magicSb
                 let count = Int(u32(blob, 8) ?? 0)
                 for index in 0..<min(count, 32) {
                     let base = 12 + index * 8
                     guard let type = u32(blob, base), let offset = u32(blob, base + 4) else { break }
+                    facts.blobTypes.append(type)
                     guard type == 0 else { continue } // CSSLOT_CODEDIRECTORY
                     let cdStart = Int(offset)
                     guard cdStart + 44 <= blob.count, let cdMagic = u32(blob, cdStart),
