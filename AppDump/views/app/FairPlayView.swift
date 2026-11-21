@@ -38,6 +38,8 @@ struct FairPlayView: View {
     @State private var localerror: String? = nil
 
     @AppStorage("fpAllowBundleStage") private var allowBundleStage: Bool = true
+    /// 解不开的扩展是否从产物里剔除。默认关闭：删包是不可逆动作，要用户自己开。
+    @AppStorage("fpDropFailedExtensions") private var dropFailedExtensions: Bool = false
 
     private var documents: String {
         NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? ""
@@ -191,6 +193,22 @@ struct FairPlayView: View {
                 HeaderLabel(text: "暂存位置", icon: "folder.badge.gearshape")
             } footer: {
                 Text("优先用签名授权的 App Group 容器；没有时按上面的开关退到 App 包内（运行结束自动删除）。两者都不可用时才会落到 Documents，fairplayd 通常直接拒绝。")
+            }
+
+            Section {
+                Toggle(isOn: $dropFailedExtensions) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("剔除解不开的扩展")
+                            .font(.subheadline)
+                        Text("把整包都解不开的 .appex（分享面板、小组件等）从产物里整包删掉。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                HeaderLabel(text: "产物处理", icon: "scissors")
+            } footer: {
+                Text("被改过壳的包常有扩展解不开（位置没按 16 KB 对齐，内核直接拒绝），产物就会被标成 PARTIAL。打开这个开关后，那些扩展整包移除，产物是干净的、能装能用，只是少了这些扩展本身。主程序和框架不受影响；关掉时保留原样。")
             }
 
             Section {
@@ -359,7 +377,10 @@ struct FairPlayView: View {
             titleVisibility: .visible
         ) {
             if let app = installedPending {
-                Button("开始解密") { job.startInstalled(app, allowBundleStaging: allowBundleStage) }
+                Button("开始解密") {
+                    job.startInstalled(app, allowBundleStaging: allowBundleStage,
+                                       dropFailedExtensions: dropFailedExtensions)
+                }
                 Button("取消", role: .cancel) {}
             }
         }
@@ -369,7 +390,10 @@ struct FairPlayView: View {
             titleVisibility: .visible
         ) {
             if let ipa = confirming {
-                Button("开始解密") { job.startIPA(path: ipa.path, allowBundleStaging: allowBundleStage) }
+                Button("开始解密") {
+                    job.startIPA(path: ipa.path, allowBundleStaging: allowBundleStage,
+                                 dropFailedExtensions: dropFailedExtensions)
+                }
                 Button("取消", role: .cancel) {}
             }
         }

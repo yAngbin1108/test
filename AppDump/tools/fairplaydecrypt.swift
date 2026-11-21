@@ -932,12 +932,15 @@ enum FPDecryptor {
         let heuristicRejected: Int
         /// cryptid != 0 但 cryptsize == 0、只把标志清零的切片数。
         let flagsCleared: Int
+        /// 按开关从产物里剔除掉的 .appex（整包删掉，不只是丢文件）。
+        let droppedExtensions: [String]
     }
 
     /// 解密一个加密 IPA → Documents/Decrypted/<名字>-fairplay.ipa。
     /// 阻塞执行，必须在后台队列调用。
     static func decrypt(ipa: URL,
                         allowBundleStaging: Bool,
+                        dropFailedExtensions: Bool = false,
                         isCancelled: () -> Bool,
                         progress: (String, Double, String) -> Void,
                         log: @escaping (String) -> Void) throws -> Outcome {
@@ -1028,6 +1031,7 @@ enum FPDecryptor {
 
         return try finish(work: work, stem: stem, staging: stageLabel, started: started,
                           originalAppDir: nil,
+                          dropFailedExtensions: dropFailedExtensions,
                           isCancelled: isCancelled, progress: progress, log: log)
     }
 
@@ -1040,6 +1044,7 @@ enum FPDecryptor {
     static func decryptInstalledApp(bundlePath: String,
                                     appName: String,
                                     allowBundleStaging: Bool,
+                                    dropFailedExtensions: Bool = false,
                                     isCancelled: () -> Bool,
                                     progress: (String, Double, String) -> Void,
                                     copyBundle: (URL) -> Int,
@@ -1069,6 +1074,7 @@ enum FPDecryptor {
             .replacingOccurrences(of: "\t", with: "")
         return try finish(work: work, stem: stem, staging: stageLabel, started: started,
                           originalAppDir: URL(fileURLWithPath: bundlePath),
+                          dropFailedExtensions: dropFailedExtensions,
                           isCancelled: isCancelled, progress: progress, log: log)
     }
 
@@ -1079,6 +1085,7 @@ enum FPDecryptor {
                                staging: String,
                                started: Date,
                                originalAppDir: URL?,
+                               dropFailedExtensions: Bool,
                                isCancelled: () -> Bool,
                                progress: (String, Double, String) -> Void,
                                log: @escaping (String) -> Void) throws -> Outcome {
@@ -1110,6 +1117,7 @@ enum FPDecryptor {
         var decrypted = 0
         var plain = 0
         var failed = 0
+        var failedPaths: [String] = []
         var heuristicRejected = 0
         var flagsCleared = 0
         var firstFailure: String?
@@ -1170,8 +1178,37 @@ enum FPDecryptor {
                 plain += 1
             default:
                 failed += 1
+                failedPaths.append(row.path)
                 if firstFailure == nil { firstFailure = sink.last }
                 log("❌ \(row.path) — \(sink.last ?? "未知原因")")
+            }
+        }
+
+        // ── 4b. 可选：剔除整包解不开的扩展 ─────────────────────────────
+        var droppedBundles: [String] = []
+        var droppedFiles = 0
+        if dropFailedExtensions && !failedPaths.isEmpty {
+            var bundles: [String] = []
+            for path in failedPaths {
+                guard let bundle = extensionBundle(of: path) else { continue }
+                if !bundles.contains(bundle) { bundles.append(bundle) }
+            }
+            for bundle in bundles {
+                guard let dir = FPPaths.join(appDir, bundle) else { continue }
+                guard (try? manager.removeItem(at: dir)) != nil else {
+                    log("剔除失败（删不掉）：\(bundle)")
+                    continue
+                }
+                let removed = failedPaths.filter { $0 == bundle || $0.hasPrefix(bundle + "/") }.count
+                droppedFiles += removed
+                droppedBundles.append(bundle)
+                log("已剔除解不开的扩展（开关已打开）：\(bundle)（含 \(removed) 个失败文件）")
+            }
+            if !droppedBundles.isEmpty {
+                let names = droppedBundles.map { ($0 as NSString).lastPathComponent }.joined(separator: "、")
+                log("产物不再包含：\(names)。这些扩展在本机同样加载不了，删掉后产物不再标 PARTIAL。")
+            } else if bundles.isEmpty {
+                log("失败的文件都不在 .appex 里（主程序或框架），不执行剔除。")
             }
         }
 
@@ -1187,7 +1224,8 @@ enum FPDecryptor {
         // ── 5. 打包前再扫一遍 ────────────────────────────────────────
         let after = FPMachO.scanTree(appDir)
         let stillEncrypted = after.flatMap { $0.slices }.filter { $0.cryptid != 0 }.count
-        log("打包前：Mach-O \(after.count) 个，仍加密切片 \(stillEncrypted) 个")
+        log("打包前：Mach-O \(after.count) 个，仍加密切片 \(stillEncrypted) 个"
+            + (droppedBundles.isEmpty ? "" : "（已剔除 \(droppedBundles.count) 个扩展）"))
 
         guard decrypted > 0 || flagsCleared > 0 else {
             throw FPError.refused(diagnose(firstFailure: firstFailure, failed: failed,
@@ -1201,7 +1239,9 @@ enum FPDecryptor {
         progress("重新打包", 0.84, "\(stem)-fairplay.ipa")
         let outDir = FPStage.decryptedDirectory
         try? manager.createDirectory(at: outDir, withIntermediateDirectories: true)
-        let partial = failed > 0 || stillEncrypted > 0
+        // 被剔除的扩展已经不在包里了，不该再让产物背 PARTIAL。
+        let unresolvedFailed = max(0, failed - droppedFiles)
+        let partial = unresolvedFailed > 0 || stillEncrypted > 0
         let suffix = partial ? "-fairplay-PARTIAL" : "-fairplay"
         let output = outDir.appendingPathComponent("\(stem)\(suffix).ipa")
         let temp = outDir.appendingPathComponent("\(stem)\(suffix).ipa.tmp")
@@ -1250,10 +1290,19 @@ enum FPDecryptor {
         return Outcome(output: output, decrypted: decrypted, plain: plain, failed: failed,
                        machO: after.count, elapsed: Date().timeIntervalSince(started),
                        clean: clean, verifySummary: verifySummary, staging: staging,
-                       heuristicRejected: heuristicRejected, flagsCleared: flagsCleared)
+                       heuristicRejected: heuristicRejected, flagsCleared: flagsCleared,
+                       droppedExtensions: droppedBundles)
     }
 
     /// 调 C 核心；mapPath 与写入路径相同时走普通版本。
+    /// 取包内最外层的 .appex 路径，例如
+    /// `PlugIns/X.appex/PlugIns/Y.appex/Y` → `PlugIns/X.appex`。
+    private static func extensionBundle(of relative: String) -> String? {
+        let parts = relative.split(separator: "/").map(String.init)
+        guard let index = parts.firstIndex(where: { $0.hasSuffix(".appex") }) else { return nil }
+        return parts[0...index].joined(separator: "/")
+    }
+
     private static func callCore(_ inPath: String, _ mapPath: String, _ sink: FPLogSink,
                                  _ stats: inout fp_file_stats_t) -> Int32 {
         withExtendedLifetime(sink) {

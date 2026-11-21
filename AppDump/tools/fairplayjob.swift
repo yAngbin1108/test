@@ -121,7 +121,8 @@ final class FairPlayJob: ObservableObject {
 
     // MARK: - 开始
 
-    func startInstalled(_ app: DecryptApp, allowBundleStaging: Bool) {
+    func startInstalled(_ app: DecryptApp, allowBundleStaging: Bool,
+                        dropFailedExtensions: Bool = false) {
         guard !busy else { return }
         prepareRun(bundle: app.bundlePath, ipa: nil)
         AppDumpmgr.shared.logmsg("(fairplay) 直砸已安装应用 \(app.bundleID)")
@@ -137,6 +138,7 @@ final class FairPlayJob: ObservableObject {
                     bundlePath: bundlePath,
                     appName: appName,
                     allowBundleStaging: allowBundleStaging,
+                    dropFailedExtensions: dropFailedExtensions,
                     isCancelled: { token.cancelled },
                     progress: { phase, fraction, detail in
                         DispatchQueue.main.async { self.applyProgress(phase, fraction, detail) }
@@ -153,7 +155,8 @@ final class FairPlayJob: ObservableObject {
         }
     }
 
-    func startIPA(path: String, allowBundleStaging: Bool) {
+    func startIPA(path: String, allowBundleStaging: Bool,
+                  dropFailedExtensions: Bool = false) {
         guard !busy else { return }
         prepareRun(bundle: nil, ipa: path)
         AppDumpmgr.shared.logmsg("(fairplay) 开始解密 \((path as NSString).lastPathComponent)，暂存开关=\(allowBundleStaging ? "允许" : "禁用")")
@@ -166,6 +169,7 @@ final class FairPlayJob: ObservableObject {
                 let outcome = try FPDecryptor.decrypt(
                     ipa: URL(fileURLWithPath: path),
                     allowBundleStaging: allowBundleStaging,
+                    dropFailedExtensions: dropFailedExtensions,
                     isCancelled: { token.cancelled },
                     progress: { phase, fraction, detail in
                         DispatchQueue.main.async { self.applyProgress(phase, fraction, detail) }
@@ -255,6 +259,12 @@ final class FairPlayJob: ObservableObject {
             + "Mach-O \(outcome.machO) 个，耗时 \(seconds) 秒。\n"
             + "校验：\(outcome.verifySummary)\n"
             + "产物：\(outcome.output.lastPathComponent)"
+        if !outcome.droppedExtensions.isEmpty {
+            let names = outcome.droppedExtensions
+                .map { ($0 as NSString).lastPathComponent }
+                .joined(separator: "、")
+            resultText = (resultText ?? "") + "\n已按开关剔除解不开的扩展：\(names)。"
+        }
         if outcome.heuristicRejected > 0 || outcome.flagsCleared > 0 {
             var extra: [String] = []
             if outcome.heuristicRejected > 0 {
@@ -268,6 +278,9 @@ final class FairPlayJob: ObservableObject {
         if !outcome.clean {
             if outcome.heuristicRejected > 0 && outcome.failed == 0 {
                 errormsg = "产物校验未通过，但失败原因是本地判据（内核已解密），不是账号授权。请反馈日志里的 verdict= 行。"
+            } else if outcome.failed > 0, outcome.droppedExtensions.isEmpty {
+                errormsg = "有 \(outcome.failed) 个文件没解开，产物带 PARTIAL 标记。"
+                    + "\n如果它们都是扩展（.appex），可以在上方打开「剔除解不开的扩展」再跑一次，得到干净产物。"
             } else {
                 errormsg = outcome.failed > 0
                     ? "有 \(outcome.failed) 个文件没解开，产物带 PARTIAL 标记。"
