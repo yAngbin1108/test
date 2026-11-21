@@ -77,6 +77,24 @@ int fp_attempt(const char *path, const fp_slice_t *slice, int mode, bool addsigs
 /// 0 = success, 1 = not encrypted (copied as-is), -1 = failure.
 int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, void *ctx);
 
+/// 一段字节的「明文程度」探测结果。
+typedef struct {
+    int samples;          ///< 成功采样的窗口数
+    int plain_samples;    ///< 熵 < 7.3 的窗口数
+    uint64_t bytes;       ///< 采样总字节
+    double entropy;       ///< 合并直方图后的整体熵
+    uint32_t landmarks;   ///< ARM64 地标词（ret / pacibsp / retab）计数
+} fp_plain_probe_t;
+
+/// 采样一个切片的正文（跳过声明的加密区）与声明的加密区本身。
+/// body / region 任一个可为 NULL。0 = 至少 body 采到过数据。
+int fp_probe_plaintext(const char *path, const fp_slice_t *slice,
+                       fp_plain_probe_t *body, fp_plain_probe_t *region);
+
+/// 采样结果像不像明文：过半窗口熵 < 7.3 即认为明文。
+/// 未解开的密文每个窗口都停在 ~7.95，所以这个判据对密文是安全的（不会误判）。
+bool fp_probe_is_plain(const fp_plain_probe_t *probe);
+
 /// 每个文件的分类计数。用来区分「内核真的拒绝（授权问题）」和
 /// 「内核已经把页解开了、我们自己的判据没通过」——后者绝不能拿去
 /// 告诉用户"没有解密授权 / 去 App Store 登录"。
@@ -84,6 +102,8 @@ typedef struct {
     int slices_total;        ///< 带非零 cryptsize 的加密切片数
     int slices_ok;           ///< 明文已写回并清了 cryptid 的切片数
     int slices_plain;        ///< cryptid != 0 但 cryptsize == 0：只清标志，没有明文要产出
+    int slices_fake_plain;   ///< 声明加密但正文已是明文（假加密壳）：跳过解密、清 cryptid 直接出包
+    int residue_cipher;      ///< 假加密壳里那一小段声明区间仍是密文（无法解开），已按原样保留
     int heuristic_rejected;  ///< 内核成功、全部页回读成功、字节已变化，但判据判否
 } fp_file_stats_t;
 

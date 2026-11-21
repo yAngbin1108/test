@@ -319,6 +319,111 @@ int fp_parse(const char *path, fp_slice_t *slices, int max, int *count,
     return rc;
 }
 
+#pragma mark - plaintext probe
+
+// 「假加密壳」检测：签名被剥掉、正文其实已经是明文的包，cryptid 还写着 1，
+// 加密区往往只剩一页（工具重签时缩小的占位）。这类包内核 mremap 必定失败
+// （未页对齐），但根本不需要解密——直接清标志按明文出包即可。
+// 判据必须保守：真加密包的 __TEXT 整个在声明区间里，我们跳过它采样到的是
+// 头部/__LINKEDIT（也是低熵），所以**只有声明区间小到不像真加密区时**才走这条路。
+
+static bool fp_probe_window(int fd, uint64_t off, size_t len,
+                            uint64_t hist[256], uint32_t *landmarks,
+                            uint64_t *bytes, int *samples, int *plain_samples) {
+    if (!len) return false;
+    uint8_t *buf = malloc(len);
+    if (!buf) return false;
+    if (!fp_pread_full(fd, buf, len, (off_t)off)) {
+        free(buf);
+        return false;
+    }
+    uint64_t local[256] = {0};
+    fp_accumulate_histogram(local, buf, len);
+    double e = fp_entropy_from_histogram(local, len);
+    if (e < 7.3) (*plain_samples)++;
+    *landmarks += fp_code_words(buf, len);
+    *bytes += len;
+    for (int k = 0; k < 256; k++) hist[k] += local[k];
+    (*samples)++;
+    free(buf);
+    return true;
+}
+
+// 在 [base, base+size) 内取 3 个窗口采样，跳过 [skip_start, skip_end)（可传 0/0）。
+static int fp_probe_span(int fd, uint64_t base, uint64_t size,
+                         uint64_t skip_start, uint64_t skip_end,
+                         fp_plain_probe_t *out) {
+    uint64_t hist[256] = {0};
+    uint32_t landmarks = 0;
+    uint64_t bytes = 0;
+    int samples = 0, plain_samples = 0;
+    if (size >= 0x1000) {
+        uint64_t limit = base + size;
+        size_t chunk = size < 0x10000 ? (size_t)size : 0x10000;
+        const double fractions[3] = {0.10, 0.50, 0.90};
+        for (int k = 0; k < 3; k++) {
+            uint64_t point = base + (uint64_t)((double)size * fractions[k]);
+            if (point + chunk > limit) point = limit - chunk;
+            if (skip_end > skip_start && point < skip_end && point + chunk > skip_start) {
+                if (skip_end + chunk <= limit) {
+                    point = skip_end;
+                } else if (skip_start >= base + chunk) {
+                    point = skip_start - chunk;
+                } else {
+                    continue;
+                }
+            }
+            fp_probe_window(fd, point, chunk, hist, &landmarks, &bytes, &samples, &plain_samples);
+        }
+    } else if (size) {
+        fp_probe_window(fd, base, (size_t)size, hist, &landmarks, &bytes, &samples, &plain_samples);
+    }
+    out->samples = samples;
+    out->plain_samples = plain_samples;
+    out->bytes = bytes;
+    out->landmarks = landmarks;
+    out->entropy = fp_entropy_from_histogram(hist, bytes);
+    return samples ? 0 : -1;
+}
+
+int fp_probe_plaintext(const char *path, const fp_slice_t *s,
+                       fp_plain_probe_t *body, fp_plain_probe_t *region) {
+    if (!path || !s) return -1;
+    if (body) memset(body, 0, sizeof *body);
+    if (region) memset(region, 0, sizeof *region);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return -1;
+    }
+    uint64_t fsz = (uint64_t)st.st_size;
+    uint64_t crypt_start = s->slice_off + s->cryptoff;
+    uint64_t crypt_end = crypt_start + (uint64_t)s->cryptsize;
+    int rc = -1;
+    if (body && s->slice_off < fsz) {
+        uint64_t avail = fsz - s->slice_off;
+        uint64_t slice_size = s->slice_size < avail ? s->slice_size : avail;
+        if (slice_size >= 0x1000 &&
+            fp_probe_span(fd, s->slice_off, slice_size, crypt_start, crypt_end, body) == 0) {
+            rc = 0;
+        }
+    }
+    if (region && crypt_end > crypt_start && crypt_start < fsz) {
+        uint64_t avail = fsz - crypt_start;
+        uint64_t n = crypt_end - crypt_start < avail ? crypt_end - crypt_start : avail;
+        fp_probe_span(fd, crypt_start, n, 0, 0, region);
+    }
+    close(fd);
+    return rc;
+}
+
+bool fp_probe_is_plain(const fp_plain_probe_t *probe) {
+    if (!probe || probe->samples <= 0) return false;
+    return probe->plain_samples * 2 > probe->samples;
+}
+
 #pragma mark - attempt
 
 // 硬条件：内核调用成功、每一页都回读成功、字节确实和密文不同。
@@ -680,6 +785,39 @@ int fp_decrypt_file_ex(const char *in_path, const char *map_path,
             fp_log(log, ctx, "  slice[%d] cryptid=%u cryptsize=0: flag cleared, no plaintext",
                    i, s->cryptid);
             continue;
+        }
+
+        // ---- 假加密壳：签名被剥掉，正文根本就是明文，只有 cryptid 还写着 1 ----
+        // 常见于各种重签工具/改壳工具（换图标、换主题、装助手）落地到设备上的副本：
+        // 加密区被缩成一页，cryptoff 只按 4 KB 对齐 ⇒ 内核 mremap 必 EINVAL。
+        // 但内容本来就是明文，不需要解密：清掉 cryptid，按明文出包。
+        // 判据保守到只对「声明区间 ≤ 1 个 16 KB 页」的切片生效，避免把真加密包
+        // （头部/__LINKEDIT 采样也是低熵）误当成明文。
+        if (s->cryptsize <= 0x4000) {
+            fp_plain_probe_t body, region;
+            if (fp_probe_plaintext(map_path, s, &body, &region) == 0 &&
+                fp_probe_is_plain(&body)) {
+                uint32_t zero = 0;
+                if (!fp_pwrite_full(out, &zero, 4, (off_t)cid_off)) {
+                    fp_log(log, ctx, "  slice[%d] flag clear failed: %s", i, strerror(errno));
+                    rc = -1;
+                    break;
+                }
+                if (stats) stats->slices_fake_plain++;
+                fp_log(log, ctx,
+                       "  slice[%d] [OK] 假加密壳：正文熵 %.2f（明文 %d/%d 窗口，地标 %u），"
+                       "声明区间 0x%x @0x%x 熵 %.2f ⇒ 已是明文，跳过解密、清 cryptid 出包",
+                       i, body.entropy, body.plain_samples, body.samples, body.landmarks,
+                       s->cryptsize, s->cryptoff, region.entropy);
+                if (!fp_probe_is_plain(&region)) {
+                    if (stats) stats->residue_cipher++;
+                    fp_log(log, ctx,
+                           "  slice[%d] ⚠️ 声明区间那 0x%x 字节仍是密文且解不开（未页对齐），"
+                           "已按原样保留；出包后若这个应用崩溃，说明那一段是真实代码，请改用 A · 内核砸壳",
+                           i, s->cryptsize);
+                }
+                continue;
+            }
         }
 
         bool done = false;

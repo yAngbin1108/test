@@ -38,6 +38,9 @@ enum FPBundleAudit {
             log("（体检）iTunesMetadata.plist：无（商店原包一般有，重签/改壳常被删）")
         }
 
+        // 2b. 时间线：区分「拷进设备时就是这样」和「装完之后被改的」
+        logTimes(appDir: appDir, log: log)
+
         // 3. 签名封条
         let resources = appDir.appendingPathComponent("_CodeSignature/CodeResources")
         if let attrs = try? manager.attributesOfItem(atPath: resources.path),
@@ -83,11 +86,52 @@ enum FPBundleAudit {
         // 没有签名时，"代码没被动过"的保证根本不存在；这时正文是不是明文
         // 只决定"改的人有没有顺便解开"，不决定"这包可不可信"。
         if !facts.hasCodeDirectory {
-            log("（体检）结论：签名被剥掉（无 CodeDirectory）、正文\(sample.isPlain ? "是明文" : "仍是密文")"
-                + " ⇒ 这份包被本地工具改过（换图标/改主题这类），不是商店原包；"
-                + "没有任何机制能保证内容等于苹果原厂，要干净包请让 App Store 重装该 App")
+            // 只说事实：这份副本没有签名、正文状态如何。
+            // 不再断言「是谁改的」——用户可能在 App Store 里点下载，但真正落地的
+            // 字节被设备上的签名工具/主题工具/安装助手改过，这从包里看不出来。
+            log("（体检）结论：这份副本**没有签名**（无 CodeDirectory），正文"
+                + "\(sample.isPlain ? "是明文" : "仍是密文")"
+                + (sample.isPlain
+                   ? " ⇒ 它与商店原包不再一致，但也**不需要砸壳**：正文本来就能读，"
+                     + "AppDump 会直接清掉 cryptid 按明文出包。"
+                   : " ⇒ 加密且无签名，属于半残包，建议改用 A · 内核砸壳。")
+                + "\n（体检）如果要干净的原厂字节：App Store 里删掉这个应用再重新下载，"
+                + "并且全程不要经过任何签名/主题/安装助手工具。")
         } else {
             log("（体检）结论：\(sample.verdict)")
+        }
+    }
+
+    // MARK: - 时间线
+
+    /// 打印能回答「谁改的、什么时候改的」的时间戳。
+    /// 容器目录的创建时间≈安装时间；各文件 mtime 晚于它就是装完之后又被改过。
+    private static func logTimes(appDir: URL, log: @escaping (String) -> Void) {
+        let manager = FileManager.default
+        let parent = appDir.deletingLastPathComponent()
+        func stamp(_ url: URL) -> String {
+            guard let attrs = try? manager.attributesOfItem(atPath: url.path) else { return "读不到" }
+            let modified = attrs[.modificationDate] as? Date
+            let created = attrs[.creationDate] as? Date
+            let big = DateFormatter()
+            big.dateFormat = "MM-dd HH:mm:ss"
+            let text = modified.map { big.string(from: $0) } ?? "—"
+            if let created, let modified, abs(created.timeIntervalSince(modified)) > 60 {
+                return text + "（创建 " + big.string(from: created) + "）"
+            }
+            return text
+        }
+        let install = stamp(parent)
+        log("（体检）时间线：安装/容器 \(install) · .app \(stamp(appDir))"
+            + " · Info.plist \(stamp(appDir.appendingPathComponent("Info.plist")))"
+            + " · _CodeSignature \(stamp(appDir.appendingPathComponent("_CodeSignature/CodeResources")))")
+        if let exeName = bundleExecutable(appDir) {
+            log("（体检）时间线：主程序 \(exeName) \(stamp(appDir.appendingPathComponent(exeName)))")
+        }
+        // 兄弟目录里就能看出还有多少别的应用是同一种形状，不是判断依据，纯参考。
+        let meta = appDir.appendingPathComponent("iTunesMetadata.plist")
+        if manager.fileExists(atPath: meta.path) {
+            log("（体检）时间线：iTunesMetadata.plist \(stamp(meta))")
         }
     }
 

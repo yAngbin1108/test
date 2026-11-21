@@ -1120,6 +1120,8 @@ enum FPDecryptor {
         var failedPaths: [String] = []
         var heuristicRejected = 0
         var flagsCleared = 0
+        var fakePlain = 0
+        var residueCipher = 0
         var firstFailure: String?
         let total = max(encryptedFiles.count, 1)
 
@@ -1163,11 +1165,17 @@ enum FPDecryptor {
             }
             heuristicRejected += Int(stats.heuristic_rejected)
             flagsCleared += Int(stats.slices_plain)
+            fakePlain += Int(stats.slices_fake_plain)
+            residueCipher += Int(stats.residue_cipher)
 
             switch status {
             case 0:
+                // 假加密壳：正文本来就是明文，只把 cryptid 清掉就出包了。
+                if Int(stats.slices_fake_plain) > 0 && Int(stats.slices_ok) == 0 {
+                    decrypted += 1
+                    log("✅ 已按明文出包（假加密壳，本来就不需要解密）\(row.path)")
                 // 只清了 cryptid 标志、没有明文要产出的文件，不能算一次解密。
-                if stats.slices_ok == 0 && stats.slices_plain > 0 {
+                } else if stats.slices_ok == 0 && stats.slices_plain > 0 {
                     plain += 1
                     log("仅清标志（cryptsize=0）\(row.path)")
                 } else {
@@ -1214,6 +1222,14 @@ enum FPDecryptor {
 
         if flagsCleared > 0 {
             log("清了 \(flagsCleared) 个 cryptsize=0 切片的 cryptid 标志（没有明文要产出）")
+        }
+        if fakePlain > 0 {
+            log("假加密壳：\(fakePlain) 个切片「声明加密、正文其实是明文」，已清 cryptid 直接出包（没走解密）。"
+                + "这种包是重签/改壳工具留在设备上的副本，内核无论怎样都解不开，但它本来就没有密文要解。")
+        }
+        if residueCipher > 0 {
+            log("⚠️ 其中 \(residueCipher) 个切片声明的那 0x1000 字节仍是密文且未页对齐、无法解开，已按原样保留。"
+                + "装上后若该应用崩溃，说明那一段是真实代码，请改用 A · 内核砸壳。")
         }
         if heuristicRejected > 0 {
             // 绝不能报成「FairPlay 拒绝」：内核已经把页解开了。
@@ -1345,8 +1361,9 @@ enum FPDecryptor {
             let pageKB = kernelPage / 1024
             if slice.cryptsize <= 0x1000 && slice.cryptoff % 0x1000 == 0 {
                 alignNote = String(format: " · ⚠️ cryptoff 只按 4 KB 对齐（未按 %llu KB），"
-                                   + "且加密区只有 0x%llx（一页）：这是被改过壳的包，"
-                                   + "这一片内核必然拒绝，不是授权问题",
+                                   + "且加密区只有 0x%llx（一页）：这是被改过壳的副本，"
+                                   + "这一片内核必然拒绝，不是授权问题；"
+                                   + "若正文已是明文，会直接按明文出包",
                                    pageKB, slice.cryptsize)
             } else {
                 alignNote = String(format: " · ⚠️ cryptoff 未按 %llu KB 页对齐，"
@@ -1411,9 +1428,10 @@ enum FPDecryptor {
         if lower.contains("invalid argument") {
             if fromInstalledApp {
                 text += "\n映射参数被拒绝：cryptoff 不是 16 KB 页对齐（日志里带 ⚠️ 的行）。"
-                    + "\n这份「已安装应用」多半被别人重签/重打包过（主二进制只有 1 个加密页，"
-                    + "而官方包是上万页），这种包 fairplayd 一律拒绝。"
-                    + "\n请改用上面的「导入加密 IPA」：导入从 App Store 下载的原始 IPA 再解。"
+                    + "\n这份副本的加密区只有一页（官方包是上万页）、签名也被剥掉了，"
+                    + "说明它是被重签/改壳工具处理过的落地副本。"
+                    + "\n如果日志里没有出现「假加密壳：正文熵 …」那一行，说明正文确实还是密文，"
+                    + "这种包 FairPlay 路径无解，请改用 A · 内核砸壳或导入 App Store 原始 IPA。"
             } else {
                 text += "\n映射参数被拒绝：这个 IPA 里的二进制 cryptoff 不是 16 KB 页对齐"
                     + "（日志里带 ⚠️ 的行），内核只接受页对齐的 mremap_encrypted 地址。"
