@@ -263,7 +263,7 @@ final class FairPlayJob: ObservableObject {
             if outcome.flagsCleared > 0 {
                 extra.append("清了 \(outcome.flagsCleared) 个 cryptsize=0 切片的加密标志")
             }
-            resultText += "\n" + extra.joined(separator: "；") + "。"
+            resultText = (resultText ?? "") + "\n" + extra.joined(separator: "；") + "。"
         }
         if !outcome.clean {
             if outcome.heuristicRejected > 0 && outcome.failed == 0 {
