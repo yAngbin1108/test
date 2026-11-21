@@ -373,6 +373,10 @@ enum vfsfs {
         }
         let noicon = icons.filter { $0 == nil }.count
         log("listappbundles 统计：容器=\(containers.count) 读不到=\(subnil) 无app=\(noapp) 无plist=\(noplist) 结果=\(out.count) 无图标=\(noicon)")
+        // vfslistdir 的失败/成功不再逐条刷日志，这里给一行汇总
+        if AppDumpmgr.vfslistdirFailures > 0 || AppDumpmgr.vfslistdirSuccesses > 0 {
+            log("vfs listdir：成功 \(AppDumpmgr.vfslistdirSuccesses) 次 / 失败 \(AppDumpmgr.vfslistdirFailures) 次（失败已回退 FileManager）")
+        }
         if !firsterr.isEmpty { log("首个异常：\(firsterr)") }
         log("listed \(out.count) app bundles")
         return out

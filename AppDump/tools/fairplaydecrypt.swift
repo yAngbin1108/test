@@ -1100,6 +1100,9 @@ enum FPDecryptor {
         let sinfCopied = FPSinf.replicate(appDir: appDir, machos: inventory, log: log)
         log("Mach-O \(inventory.count) 个，其中加密 \(encryptedFiles.count) 个；SINF 补齐 \(sinfCopied) 个")
 
+        // 体检：这个包到底是商店原包，还是被解过/改过壳的包。
+        FPBundleAudit.run(appDir: appDir, rows: inventory, log: log)
+
         var encryptedKeys = Set<String>()
         for row in encryptedFiles { encryptedKeys.insert(appPrefix + row.path) }
 
@@ -1128,18 +1131,27 @@ enum FPDecryptor {
                 log(line.trimmingCharacters(in: .whitespaces))
             }
             var stats = fp_file_stats_t()
-            var status = callCore(url.path, url.path, sink, &stats)
+            var status: Int32
 
-            // 拷贝出来的副本 fairplayd 有时不认（"Cannot allocate memory"）。
-            // 已安装应用时直接映射原始安装路径再解一次：fairplayd 读得到别的
-            // App 的安装包，明文照样写进我们自己的副本。
-            if status != 0, status != 1, let originalRoot = originalAppDir,
+            // 直砸已装应用时先映射原始安装路径：fairplayd 只认安装目录里的
+            // 那一份（暂存副本经常直接 ENOMEM），先试副本等于白跑一轮，
+            // 还会把诊断引到「ENOMEM = 授权问题」上去。
+            if let originalRoot = originalAppDir,
                let originalPath = FPPaths.join(originalRoot, row.path)?.path,
+               originalPath != url.path,
                manager.fileExists(atPath: originalPath) {
-                log("改用原始安装路径重试：\(row.path)")
-                var retryStats = fp_file_stats_t()
-                status = callCore(url.path, originalPath, sink, &retryStats)
-                if status == 0 { stats = retryStats }
+                status = callCore(url.path, originalPath, sink, &stats)
+                if status != 0, status != 1 {
+                    log("原始安装路径失败，改用暂存副本重试：\(row.path)")
+                    var retryStats = fp_file_stats_t()
+                    let retry = callCore(url.path, url.path, sink, &retryStats)
+                    if retry == 0 || retry == 1 {
+                        status = retry
+                        stats = retryStats
+                    }
+                }
+            } else {
+                status = callCore(url.path, url.path, sink, &stats)
             }
             heuristicRejected += Int(stats.heuristic_rejected)
             flagsCleared += Int(stats.slices_plain)
@@ -1276,13 +1288,22 @@ enum FPDecryptor {
            let size = attrs[.size] as? NSNumber {
             sinfText = "\(size.intValue) B"
         }
-        // cryptoff 不是 16 KB 页对齐时，内核 mremap_encrypted 根本不会接受
-        // 那个地址。C 层现在会从页首重试，这里把情况标出来，便于看日志。
+        // cryptoff 不是 16 KB 页对齐时，内核 mremap_encrypted 一律 EINVAL，
+        // 这不是授权问题，也不是换个工具就能过。
         var alignNote = ""
         let kernelPage = UInt64(getpagesize() > 0 ? getpagesize() : 16384)
         if slice.cryptoff % kernelPage != 0 {
-            alignNote = String(format: " · ⚠️ cryptoff 未按 %llu KB 页对齐，内核会拒绝 FairPlay（这类文件只能走内核砸壳）",
-                               kernelPage / 1024)
+            let pageKB = kernelPage / 1024
+            if slice.cryptsize <= 0x1000 && slice.cryptoff % 0x1000 == 0 {
+                alignNote = String(format: " · ⚠️ cryptoff 只按 4 KB 对齐（未按 %llu KB），"
+                                   + "且加密区只有 0x%llx（一页）：这是被改过壳的包，"
+                                   + "这一片内核必然拒绝，不是授权问题",
+                                   pageKB, slice.cryptsize)
+            } else {
+                alignNote = String(format: " · ⚠️ cryptoff 未按 %llu KB 页对齐，"
+                                   + "内核只接受页对齐的 mremap_encrypted 地址，这一片必然失败",
+                                   pageKB)
+            }
         }
         return String(format: "%@ · cpu=0x%x/0x%x cryptoff=0x%llx cryptsize=0x%llx cryptid=%u · SC_Info %@%@",
                       row.path,

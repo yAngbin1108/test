@@ -290,6 +290,11 @@ final class AppDumpmgr: ObservableObject {
         }
     }
     
+    /// vfslistdir 的失败/成功日志：144 个应用逐个刷会淹掉日志正文，
+    /// 所以只记前几次失败 + 累计次数，成功行不再逐条打印。
+    static private(set) var vfslistdirFailures = 0
+    static private(set) var vfslistdirSuccesses = 0
+
     func vfslistdir(path: String) -> [(name: String, isDir: Bool)]? {
         guard vfsready else {
             logmsg(" listdir: not ready (\(path))")
@@ -299,7 +304,10 @@ final class AppDumpmgr: ObservableObject {
         var count: Int32 = 0
         let r = vfs_listdir(path, &ptr, &count)
         guard r == 0, let entries = ptr else {
-            logmsg(" listdir failed (\(path)) r=\(r)")
+            AppDumpmgr.vfslistdirFailures += 1
+            if AppDumpmgr.vfslistdirFailures <= 3 {
+                logmsg(" listdir failed (\(path)) r=\(r)（同类失败之后只计数，不再逐条打印）")
+            }
             return nil
         }
         defer { vfs_freelisting(entries) }
@@ -312,7 +320,7 @@ final class AppDumpmgr: ObservableObject {
             }
             items.append((name, e.d_type == 4))
         }
-        logmsg(" listdir \(path) -> \(items.count)")
+        AppDumpmgr.vfslistdirSuccesses += 1
         return items.sorted { $0.0.lowercased() < $1.0.lowercased() }
     }
     

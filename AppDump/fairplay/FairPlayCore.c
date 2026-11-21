@@ -355,9 +355,17 @@ static const char *fp_attempt_reason(const fp_attempt_t *a) {
 }
 
 void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
+    // 一页都没读回来时 ent_after 是初始值 0.00，打出来会让人误以为
+    // 「熵掉到 0 = 解开了」，所以那种情况一律写 n/a。
+    char entropy[64];
+    if (a->pages_total == 0) {
+        snprintf(entropy, sizeof entropy, "%.2f->n/a", a->ent_before);
+    } else {
+        snprintf(entropy, sizeof entropy, "%.2f->%.2f", a->ent_before, a->ent_after);
+    }
     snprintf(buf, len,
              "%s%s%s mremap=%d(%s) mmap=%s pages=%llu/%llu changed=%d "
-             "code %u->%u entropy %.2f->%.2f %.0fms verdict=%s",
+             "code %u->%u entropy %s %.0fms verdict=%s",
              fp_mode_name(a->mode), a->addsigs ? "+sigs" : "",
              a->subtype_masked ? "+sub0" : "",
              a->mremap_ret,
@@ -365,7 +373,7 @@ void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
              a->mmap_errno ? strerror(a->mmap_errno) : "ok",
              (unsigned long long)a->pages_ok, (unsigned long long)a->pages_total,
              a->changed ? 1 : 0, a->ret_before, a->ret_after,
-             a->ent_before, a->ent_after, a->ms, fp_attempt_reason(a));
+             entropy, a->ms, fp_attempt_reason(a));
 }
 
 static int fp_attempt_internal(const char *path, const fp_slice_t *s, int mode, bool addsigs,
