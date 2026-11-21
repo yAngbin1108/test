@@ -321,18 +321,43 @@ int fp_parse(const char *path, fp_slice_t *slices, int max, int *count,
 
 #pragma mark - attempt
 
+// 硬条件：内核调用成功、每一页都回读成功、字节确实和密文不同。
+// 半解半不解的映射一个都满足不了。
+static bool fp_attempt_hard_ok(const fp_attempt_t *a) {
+    return a->mremap_ret == 0 && a->pages_ok == a->pages_total && a->changed;
+}
+
 bool fp_attempt_looks_decrypted(const fp_attempt_t *a) {
-    // Encrypted text stays at ~8.0 bits/byte regardless of size; real ARM64
-    // code is well below 7.5. One extra RET/PACIBSP word is enough for a
-    // single-page binary.
-    return a->mremap_ret == 0 && a->pages_ok == a->pages_total && a->changed &&
-           a->ent_before > 7.9 && a->ent_after < 7.5 && a->ret_after > a->ret_before;
+    // 只按「熵掉下来了没有」判，不再数 ARM64 地标词（ret/pacibsp）。
+    // 实测（iPadn 2026-11-19 真机样本）：真正解开 17 个文件，峰值熵 7.06；
+    // 旧地标规则判错的 14 个其实是数据型/重度混淆载荷，熵只有 0.53–6.19、
+    // code 0→0。数地标会把它们当失败，白试其余模式，还出 -PARTIAL。
+    // 未解开的密文始终停在 ~8.0，半解开的页 > 7.8。
+    if (!fp_attempt_hard_ok(a)) return false;
+    if (!(a->ent_before > 7.9)) return false;
+    if (a->ent_after >= 7.5) return false;
+    if ((a->ent_before - a->ent_after) < 0.5) return false;
+    // ret_after / ret_before 仍留在日志里当地标诊断，不参与判定。
+    return true;
+}
+
+/// 判据没通过时的一句话原因，写进日志便于定位。
+static const char *fp_attempt_reason(const fp_attempt_t *a) {
+    if (!fp_attempt_hard_ok(a)) {
+        if (a->mremap_ret != 0) return "mremap";
+        if (a->pages_ok != a->pages_total) return "pages";
+        return "unchanged";
+    }
+    if (!(a->ent_before > 7.9)) return "src_plain";
+    if (a->ent_after >= 7.5) return "ent_high";
+    if ((a->ent_before - a->ent_after) < 0.5) return "drop_small";
+    return "pass";
 }
 
 void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
     snprintf(buf, len,
              "%s%s%s mremap=%d(%s) mmap=%s pages=%llu/%llu changed=%d "
-             "code %u->%u entropy %.2f->%.2f %.0fms",
+             "code %u->%u entropy %.2f->%.2f %.0fms verdict=%s",
              fp_mode_name(a->mode), a->addsigs ? "+sigs" : "",
              a->subtype_masked ? "+sub0" : "",
              a->mremap_ret,
@@ -340,7 +365,7 @@ void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len) {
              a->mmap_errno ? strerror(a->mmap_errno) : "ok",
              (unsigned long long)a->pages_ok, (unsigned long long)a->pages_total,
              a->changed ? 1 : 0, a->ret_before, a->ret_after,
-             a->ent_before, a->ent_after, a->ms);
+             a->ent_before, a->ent_after, a->ms, fp_attempt_reason(a));
 }
 
 static int fp_attempt_internal(const char *path, const fp_slice_t *s, int mode, bool addsigs,
@@ -552,15 +577,17 @@ static int fp_copy_file(const char *src, const char *dst) {
 }
 
 int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, void *ctx) {
-    return fp_decrypt_file_ex(in_path, in_path, out_path, log, ctx);
+    return fp_decrypt_file_ex(in_path, in_path, out_path, log, ctx, NULL);
 }
 
 // map_path 与 in_path 可以不同：把"从哪个文件映射并回读明文"和"写回哪个文件"
 // 拆开。已安装应用可以直接映射原始路径（fairplayd 读得到别人的安装包），
 // 明文再写进我们自己的暂存副本，这样拷贝位置就不会影响 fairplayd 的判定。
 int fp_decrypt_file_ex(const char *in_path, const char *map_path,
-                       const char *out_path, fp_log_t log, void *ctx) {
+                       const char *out_path, fp_log_t log, void *ctx,
+                       fp_file_stats_t *stats) {
     if (!in_path || !map_path || !out_path) return -1;
+    if (stats) memset(stats, 0, sizeof *stats);
     fp_slice_t slices[FP_MAX_SLICES];
     int count = 0;
     char err[256] = {0};
@@ -572,6 +599,9 @@ int fp_decrypt_file_ex(const char *in_path, const char *map_path,
     bool encrypted = false;
     for (int i = 0; i < count; i++) {
         if (slices[i].has_enc && slices[i].cryptid != 0) encrypted = true;
+        if (slices[i].has_enc && slices[i].cryptid != 0 && slices[i].cryptsize > 0 && stats) {
+            stats->slices_total++;
+        }
     }
     bool same_path = strcmp(in_path, out_path) == 0;
     if (!encrypted) {
@@ -620,13 +650,30 @@ int fp_decrypt_file_ex(const char *in_path, const char *map_path,
     int rc = 0;
     for (int i = 0; i < count && rc == 0; i++) {
         const fp_slice_t *s = &slices[i];
-        if (!s->has_enc || s->cryptid == 0 || s->cryptsize == 0) continue;
+        if (!s->has_enc || s->cryptid == 0) continue;
         uint64_t cid_off = s->enc_lc_off + offsetof(struct encryption_info_command, cryptid);
         if (cid_off < s->slice_off || cid_off + 4 > s->slice_off + s->slice_size) {
             fp_log(log, ctx, "  slice[%d] invalid encryption command offset", i);
             rc = -1;
             break;
         }
+
+        // cryptid != 0 但没有声明任何加密区间：没有明文要产出，只需要把标志清零。
+        // 以前这里直接 continue，胖二进制/多加密命令时另一个切片会让整个文件
+        // 保持 cryptid != 0，校验就会报「仍加密」并出 -PARTIAL。
+        if (s->cryptsize == 0) {
+            uint32_t zero = 0;
+            if (!fp_pwrite_full(out, &zero, 4, (off_t)cid_off)) {
+                fp_log(log, ctx, "  slice[%d] flag clear failed: %s", i, strerror(errno));
+                rc = -1;
+                break;
+            }
+            if (stats) stats->slices_plain++;
+            fp_log(log, ctx, "  slice[%d] cryptid=%u cryptsize=0: flag cleared, no plaintext",
+                   i, s->cryptid);
+            continue;
+        }
+
         bool done = false;
         for (size_t k = 0; k < sizeof order / sizeof order[0] && !done; k++) {
             fp_attempt_t attempt;
@@ -636,15 +683,32 @@ int fp_decrypt_file_ex(const char *in_path, const char *map_path,
             int attempt_rc = fp_attempt_internal(map_path, &variant, order[k].mode, order[k].addsigs,
                                                  NULL, out, &attempt);
             attempt.subtype_masked = order[k].mask;
+            bool hard_ok = fp_attempt_hard_ok(&attempt);
             fp_attempt_describe(&attempt, line, sizeof line);
             done = (attempt_rc == 0) && fp_attempt_looks_decrypted(&attempt);
             fp_log(log, ctx, "  slice[%d] %s %s", i, done ? "[OK]" : "[--]", line);
+            if (hard_ok && !done) {
+                // 内核成功了、每一页都回来了、字节也确实变了，只是判据判否：
+                // 其余模式解的是同一段，不可能更好，直接放弃这一轮。
+                if (stats) stats->heuristic_rejected++;
+                fp_log(log, ctx,
+                       "  slice[%d] heuristic rejected: kernel ok, pages %llu/%llu, "
+                       "entropy %.2f->%.2f (%s), code %u->%u",
+                       i, (unsigned long long)attempt.pages_ok,
+                       (unsigned long long)attempt.pages_total,
+                       attempt.ent_before, attempt.ent_after,
+                       fp_attempt_reason(&attempt),
+                       attempt.ret_before, attempt.ret_after);
+                break;
+            }
         }
         if (!done) { rc = -1; break; }
         uint32_t zero = 0;
         if (!fp_pwrite_full(out, &zero, 4, (off_t)cid_off)) {
             fp_log(log, ctx, "  write failed: %s", strerror(errno));
             rc = -1;
+        } else if (stats) {
+            stats->slices_ok++;
         }
     }
     close(out);

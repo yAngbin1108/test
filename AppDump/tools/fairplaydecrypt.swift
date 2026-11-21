@@ -899,7 +899,10 @@ enum FPVerifier {
                     stats.feed(pointer, count)
                 }
                 contentChecked += 1
-                if stats.total > 0 && (stats.entropy >= 7.5 || stats.codeWords == 0) {
+                // 只看熵：未解开的密文始终停在 ~8.0，解开的代码/数据落在 0.5–7.1。
+                // 数 ARM64 地标词会把数据型、重度混淆的载荷判成「不像明文」
+                // （实测 14 个假失败熵 0.53–6.19、地标词 0→0），所以地标只当日志。
+                if stats.total > 0 && stats.entropy >= 7.5 {
                     failures.append(String(format: "内容不像明文：%@（熵 %.2f，地标词 %d）",
                                            entry.path, stats.entropy, stats.codeWords))
                 }
@@ -924,6 +927,11 @@ enum FPDecryptor {
         let clean: Bool
         let verifySummary: String
         let staging: String
+        /// 内核成功、全部页回读成功、字节已变化，但本地判据判否的切片数。
+        /// 只要这个数大于 0，就不能把失败说成「没有授权」，UI 也不能引导去商店登录。
+        let heuristicRejected: Int
+        /// cryptid != 0 但 cryptsize == 0、只把标志清零的切片数。
+        let flagsCleared: Int
     }
 
     /// 解密一个加密 IPA → Documents/Decrypted/<名字>-fairplay.ipa。
@@ -1099,6 +1107,8 @@ enum FPDecryptor {
         var decrypted = 0
         var plain = 0
         var failed = 0
+        var heuristicRejected = 0
+        var flagsCleared = 0
         var firstFailure: String?
         let total = max(encryptedFiles.count, 1)
 
@@ -1109,14 +1119,6 @@ enum FPDecryptor {
                 log("路径无效，跳过：\(row.path)")
                 continue
             }
-            // cryptid 非 0 但 cryptsize 为 0：内核也认为没有需要解密的页，
-            // 当作明文处理，不要白试四轮再报错。
-            if (row.slices.first(where: { $0.cryptid != 0 })?.cryptsize ?? 0) == 0 {
-                plain += 1
-                log("跳过（没有加密区间）：\(row.path)")
-                continue
-            }
-
             progress("正在解密", 0.06 + 0.74 * Double(index) / Double(total),
                      "\(index + 1)/\(encryptedFiles.count) · \(row.path)")
 
@@ -1125,7 +1127,8 @@ enum FPDecryptor {
             let sink = FPLogSink { line in
                 log(line.trimmingCharacters(in: .whitespaces))
             }
-            var status = callCore(url.path, url.path, sink)
+            var stats = fp_file_stats_t()
+            var status = callCore(url.path, url.path, sink, &stats)
 
             // 拷贝出来的副本 fairplayd 有时不认（"Cannot allocate memory"）。
             // 已安装应用时直接映射原始安装路径再解一次：fairplayd 读得到别的
@@ -1134,13 +1137,23 @@ enum FPDecryptor {
                let originalPath = FPPaths.join(originalRoot, row.path)?.path,
                manager.fileExists(atPath: originalPath) {
                 log("改用原始安装路径重试：\(row.path)")
-                status = callCore(url.path, originalPath, sink)
+                var retryStats = fp_file_stats_t()
+                status = callCore(url.path, originalPath, sink, &retryStats)
+                if status == 0 { stats = retryStats }
             }
+            heuristicRejected += Int(stats.heuristic_rejected)
+            flagsCleared += Int(stats.slices_plain)
 
             switch status {
             case 0:
-                decrypted += 1
-                log("✅ 已解密 \(row.path)")
+                // 只清了 cryptid 标志、没有明文要产出的文件，不能算一次解密。
+                if stats.slices_ok == 0 && stats.slices_plain > 0 {
+                    plain += 1
+                    log("仅清标志（cryptsize=0）\(row.path)")
+                } else {
+                    decrypted += 1
+                    log("✅ 已解密 \(row.path)")
+                }
             case 1:
                 plain += 1
             default:
@@ -1150,14 +1163,24 @@ enum FPDecryptor {
             }
         }
 
+        if flagsCleared > 0 {
+            log("清了 \(flagsCleared) 个 cryptsize=0 切片的 cryptid 标志（没有明文要产出）")
+        }
+        if heuristicRejected > 0 {
+            // 绝不能报成「FairPlay 拒绝」：内核已经把页解开了。
+            log("⚠️ 本地判据拒绝了 \(heuristicRejected) 个切片：内核成功、每页都回读、字节已变化，"
+                + "只是熵判据没过（见上面 verdict= 行）。这不是授权问题。")
+        }
+
         // ── 5. 打包前再扫一遍 ────────────────────────────────────────
         let after = FPMachO.scanTree(appDir)
         let stillEncrypted = after.flatMap { $0.slices }.filter { $0.cryptid != 0 }.count
         log("打包前：Mach-O \(after.count) 个，仍加密切片 \(stillEncrypted) 个")
 
-        guard decrypted > 0 else {
+        guard decrypted > 0 || flagsCleared > 0 else {
             throw FPError.refused(diagnose(firstFailure: firstFailure, failed: failed,
                                           stillEncrypted: stillEncrypted,
+                                          heuristicRejected: heuristicRejected,
                                           fromInstalledApp: originalAppDir != nil))
         }
         if isCancelled() { throw FPError.cancelled }
@@ -1214,20 +1237,24 @@ enum FPDecryptor {
         progress("完成", 1, output.lastPathComponent)
         return Outcome(output: output, decrypted: decrypted, plain: plain, failed: failed,
                        machO: after.count, elapsed: Date().timeIntervalSince(started),
-                       clean: clean, verifySummary: verifySummary, staging: staging)
+                       clean: clean, verifySummary: verifySummary, staging: staging,
+                       heuristicRejected: heuristicRejected, flagsCleared: flagsCleared)
     }
 
     /// 调 C 核心；mapPath 与写入路径相同时走普通版本。
-    private static func callCore(_ inPath: String, _ mapPath: String, _ sink: FPLogSink) -> Int32 {
+    private static func callCore(_ inPath: String, _ mapPath: String, _ sink: FPLogSink,
+                                 _ stats: inout fp_file_stats_t) -> Int32 {
         withExtendedLifetime(sink) {
             let context = Unmanaged.passUnretained(sink).toOpaque()
             return inPath.withCString { input in
                 inPath.withCString { output in
                     if mapPath == inPath {
-                        return fp_decrypt_file(input, output, fpCoreLogTrampoline, context)
+                        return fp_decrypt_file_ex(input, input, output,
+                                                  fpCoreLogTrampoline, context, &stats)
                     }
                     return mapPath.withCString { mapped in
-                        fp_decrypt_file_ex(input, mapped, output, fpCoreLogTrampoline, context)
+                        fp_decrypt_file_ex(input, mapped, output,
+                                           fpCoreLogTrampoline, context, &stats)
                     }
                 }
             }
@@ -1271,40 +1298,56 @@ enum FPDecryptor {
     /// 把 C 层的失败行翻成能照做的建议。最常见的其实是"这台设备没有该账号的
     /// 解密授权"：用哪个账号下载的，就得让那个账号在系统 App Store 登录一次。
     private static func diagnose(firstFailure: String?, failed: Int, stillEncrypted: Int,
+                                 heuristicRejected: Int,
                                  fromInstalledApp: Bool) -> String {
         var text = "\(failed) 个文件失败，\(stillEncrypted) 个切片仍加密。"
+
+        // 内核干了活、我们自己的判据判否：这不能算「没有授权」，更不能引用户去商店。
+        if heuristicRejected > 0 {
+            return text + "\n\n其中 \(heuristicRejected) 个切片其实是内核解开的"
+                + "（mremap 成功、每一页都回读成功、密文熵已经掉下来），"
+                + "只是本地判据没过。这不是账号或授权问题，也不该去 App Store 登录。"
+                + "\n请把日志里 verdict= 那几行一起反馈，按样本调判据。"
+        }
+
         guard let raw = firstFailure?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
             return text
         }
         let lower = raw.lowercased()
-        if lower.contains("cannot allocate memory") {
+        // 只有主路径（READ/cryptid2，不带 EXEC）的 errno 才能下结论：
+        // READ|EXEC/cryptid1 在无特权进程上必然 mmap EPERM，把它读成
+        // 「账号没有授权」正是以前把用户赶去 App Store 白折腾的原因。
+        let mainPath = lower.contains("cid2") && !lower.contains("exec")
+
+        if mainPath && lower.contains("cannot allocate memory") {
             return "fairplayd 无法为该文件建立解密会话（内核返回 ENOMEM，不是账号授权问题）。\n\n"
                 + "常见原因：\n"
                 + "· 这个二进制是 arm64e，或者 SINF 与文件版本对不上（应用刚更新过、或从别的账号/工具装进来的）；\n"
                 + "· 副本位置不被接受。日志里若出现「改用原始安装路径重试」，那是第二条映射路径，也失败了就说明是前者。\n\n"
                 + "这种应用请改用 A · 内核砸壳（它不经过 fairplayd，只要能让目标进程跑起来就能读内存）。"
         }
-        if lower.contains("not permitted") || lower.contains("permission denied") || lower.contains("operation not permitted") {
+        if mainPath && (lower.contains("permission denied") || lower.contains("not permitted")) {
             return "这台设备没有该 Apple 账号的解密授权，系统拒绝了 FairPlay 解密。\n\n"
                 + "请用下载这个应用时所用的 Apple 账号登录一次系统「App Store」"
                 + "（App Store → 右上角头像 → 登录，或 设置 → 你的名字 → 媒体与购买项目），"
                 + "然后回来重新解密。同一账号在这台设备上登录过一次即可，授权会保存在本机。"
         }
+        if !mainPath && (lower.contains("permission denied") || lower.contains("not permitted")) {
+            return text + "\n\n失败来自 READ|EXEC/cryptid1 这条备选路径，它在无特权进程上必然 mmap EPERM，"
+                + "不能据此判断账号授权。请把完整日志反馈，按主路径（cid2）的结果分析。"
+        }
+
         text += "\n内核返回：\(raw)"
         if lower.contains("invalid argument") {
             if fromInstalledApp {
-                // 已安装的包经常是别人重签/重打包过的：主二进制可能只剩一个 4 KB
-                // 的「加密标记页」，cryptoff 也不按 16 KB 对齐，fairplayd 直接拒。
-                // 而下载来的官方 IPA 是 16 KB 对齐、页数完整的，同一个内核路径能过。
                 text += "\n映射参数被拒绝：cryptoff 不是 16 KB 页对齐（日志里带 ⚠️ 的行）。"
                     + "\n这份「已安装应用」多半被别人重签/重打包过（主二进制只有 1 个加密页，"
                     + "而官方包是上万页），这种包 fairplayd 一律拒绝。"
-                    + "\n请改用上面的「导入加密 IPA」：导入从 App Store 下载的原始 IPA 再解，"
-                    + "这才是 iPadn 的做法，页对齐和授权都能对上。"
+                    + "\n请改用上面的「导入加密 IPA」：导入从 App Store 下载的原始 IPA 再解。"
             } else {
                 text += "\n映射参数被拒绝：这个 IPA 里的二进制 cryptoff 不是 16 KB 页对齐"
                     + "（日志里带 ⚠️ 的行），内核只接受页对齐的 mremap_encrypted 地址。"
-                    + "这类包 FairPlay 路径无解（iPadn 同样卡在这一步），请改用 A · 内核砸壳。"
+                    + "这类包 FairPlay 路径无解，请改用 A · 内核砸壳。"
             }
         }
         return text

@@ -255,10 +255,24 @@ final class FairPlayJob: ObservableObject {
             + "Mach-O \(outcome.machO) 个，耗时 \(seconds) 秒。\n"
             + "校验：\(outcome.verifySummary)\n"
             + "产物：\(outcome.output.lastPathComponent)"
+        if outcome.heuristicRejected > 0 || outcome.flagsCleared > 0 {
+            var extra: [String] = []
+            if outcome.heuristicRejected > 0 {
+                extra.append("另有 \(outcome.heuristicRejected) 个切片内核已解开、只是本地判据没过（不是授权问题）")
+            }
+            if outcome.flagsCleared > 0 {
+                extra.append("清了 \(outcome.flagsCleared) 个 cryptsize=0 切片的加密标志")
+            }
+            resultText += "\n" + extra.joined(separator: "；") + "。"
+        }
         if !outcome.clean {
-            errormsg = outcome.failed > 0
-                ? "有 \(outcome.failed) 个文件没解开，产物带 PARTIAL 标记。"
-                : "产物校验未通过，请检查日志。"
+            if outcome.heuristicRejected > 0 && outcome.failed == 0 {
+                errormsg = "产物校验未通过，但失败原因是本地判据（内核已解密），不是账号授权。请反馈日志里的 verdict= 行。"
+            } else {
+                errormsg = outcome.failed > 0
+                    ? "有 \(outcome.failed) 个文件没解开，产物带 PARTIAL 标记。"
+                    : "产物校验未通过，请检查日志。"
+            }
         } else {
             errormsg = nil
         }

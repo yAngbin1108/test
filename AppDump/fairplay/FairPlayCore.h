@@ -77,14 +77,27 @@ int fp_attempt(const char *path, const fp_slice_t *slice, int mode, bool addsigs
 /// 0 = success, 1 = not encrypted (copied as-is), -1 = failure.
 int fp_decrypt_file(const char *in_path, const char *out_path, fp_log_t log, void *ctx);
 
+/// 每个文件的分类计数。用来区分「内核真的拒绝（授权问题）」和
+/// 「内核已经把页解开了、我们自己的判据没通过」——后者绝不能拿去
+/// 告诉用户"没有解密授权 / 去 App Store 登录"。
+typedef struct {
+    int slices_total;        ///< 带非零 cryptsize 的加密切片数
+    int slices_ok;           ///< 明文已写回并清了 cryptid 的切片数
+    int slices_plain;        ///< cryptid != 0 但 cryptsize == 0：只清标志，没有明文要产出
+    int heuristic_rejected;  ///< 内核成功、全部页回读成功、字节已变化，但判据判否
+} fp_file_stats_t;
+
 /// 同 fp_decrypt_file，但映射/读取走 map_path（可以是只读的原始安装路径），
 /// 明文写回由 in_path 复制出来的 out_path。map_path 传 in_path 即普通用法。
+/// stats 可为 NULL。
 int fp_decrypt_file_ex(const char *in_path, const char *map_path,
-                       const char *out_path, fp_log_t log, void *ctx);
+                       const char *out_path, fp_log_t log, void *ctx,
+                       fp_file_stats_t *stats);
 
 /// Formats one attempt as a single diagnostic line.
 const char *fp_mode_name(int mode);
 void fp_attempt_describe(const fp_attempt_t *a, char *buf, size_t len);
 
-/// True when the attempt produced plausible decrypted ARM64 code.
+/// True when the attempt produced plausible plaintext (entropy collapsed).
+/// ARM64 landmark counts stay in the log as diagnostics but no longer decide it.
 bool fp_attempt_looks_decrypted(const fp_attempt_t *a);
