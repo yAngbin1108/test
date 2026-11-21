@@ -73,11 +73,21 @@ enum FPBundleAudit {
                        cryptSize, textExec, percent, slice.cryptid))
         }
 
-        if let sample = sampleText(exe, slice: slice, facts: facts) {
-            log("（体检）正文抽样（加密区之外）：\(sample.detail)")
-            log("（体检）结论：\(sample.verdict)")
-        } else {
+        guard let sample = sampleText(exe, slice: slice, facts: facts) else {
             log("（体检）正文抽样：读不到（文件过大或结构异常）")
+            log("（体检）结论：签名\(facts.hasCodeDirectory ? "完整" : "被剥掉")，正文未能采样，无法判断是否被解过")
+            return
+        }
+        log("（体检）正文抽样（加密区之外）：\(sample.detail)")
+
+        // 没有签名时，"代码没被动过"的保证根本不存在；这时正文是不是明文
+        // 只决定"改的人有没有顺便解开"，不决定"这包可不可信"。
+        if !facts.hasCodeDirectory {
+            log("（体检）结论：签名被剥掉（无 CodeDirectory）、正文\(sample.isPlain ? "是明文" : "仍是密文")"
+                + " ⇒ 这份包被本地工具改过（换图标/改主题这类），不是商店原包；"
+                + "没有任何机制能保证内容等于苹果原厂，要干净包请让 App Store 重装该 App")
+        } else {
+            log("（体检）结论：\(sample.verdict)")
         }
     }
 
@@ -259,6 +269,7 @@ enum FPBundleAudit {
     private struct Sample {
         let detail: String
         let verdict: String
+        let isPlain: Bool
     }
 
     private static func sampleText(_ url: URL, slice: FPMachO.Slice, facts: Facts) -> Sample? {
@@ -308,6 +319,7 @@ enum FPBundleAudit {
         } else {
             verdict = "正文部分明文、部分密文 ⇒ 混合包（多半被解过一部分）"
         }
-        return Sample(detail: details.joined(separator: " · "), verdict: verdict)
+        return Sample(detail: details.joined(separator: " · "), verdict: verdict,
+                      isPlain: lowEntropy == details.count)
     }
 }
