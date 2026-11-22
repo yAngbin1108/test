@@ -58,6 +58,8 @@ enum DecryptEngine: String {
 
 struct DecryptView: View {
     @ObservedObject private var mgr = AppDumpmgr.shared
+    // A 引擎的进度单独放一个单例：C 回调是函数指针，拿不到视图的 @State
+    @ObservedObject private var kjob = DecryptProgress.shared
     @State private var query = ""
     @State private var apps: [DecryptApp] = []
     @State private var decryptingbid: String? = nil
@@ -223,6 +225,10 @@ struct DecryptView: View {
                     AppDumpmgr.shared.logmsg("(decrypt) \(s)")
                 }
             }
+            set_progress_callback { p in
+                // C 侧已按 1% 节流，这里再做时间合并 + 主线程更新
+                DecryptProgress.shared.ingestPages(Double(p))
+            }
             if fsready { loadApps() }
             loadIPAs()
         }
@@ -323,6 +329,9 @@ struct DecryptView: View {
         VStack(spacing: 10) {
             if engine == .kernel && !fsready {
                 statusCard
+            }
+            if engine == .kernel, decryptingbid != nil || extractingbid != nil {
+                decryptProgressCard
             }
             if let error = errormsg {
                 errorCard(error)
@@ -428,6 +437,25 @@ struct DecryptView: View {
                        title: "待初始化",
                        message: "请前往「内核」页，点击“初始化系统”。")
         }
+    }
+
+    /// 砸壳进行中的实时进度（拷贝 / 逐页解密 / 打包三段合一）
+    private var decryptProgressCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(kjob.stage.isEmpty ? "砸壳中…" : kjob.stage)
+                    .font(.footnote.weight(.medium))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text("\(Int((min(max(kjob.fraction, 0), 1) * 100).rounded()))%")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: min(max(kjob.fraction, 0), 1))
+                .tint(.blue)
+        }
+        .padding(12)
+        .glassCard()
     }
 
     private func errorCard(_ msg: String) -> some View {
@@ -737,8 +765,10 @@ struct DecryptView: View {
 
     /// 砸壳/提取至少要「原包拷贝 + 打包产物」两份空间，再留 512MB 余量。
     /// 空间不够时提前报错，而不是写到一半被系统打断/闪退。
-    private func checkDiskSpace(_ app: DecryptApp) -> String? {
-        let need = bundledSize(app) * 2 + 512 * 1024 * 1024
+    /// 体积由调用方在后台算好传进来 —— 以前这里自己调 bundledSize()，
+    /// 主线程上递归枚举 GB 级目录，点一下应用就冻好几秒。
+    private func checkDiskSpace(bytes: Int64) -> String? {
+        let need = bytes * 2 + 512 * 1024 * 1024
         let free = freeDiskBytes()
         guard free > 0 else { return nil }
         if free < need {
@@ -752,16 +782,23 @@ struct DecryptView: View {
         guard mgr.dsready else { errormsg = "Darksword 未就绪，请先运行漏洞利用。"; return }
         guard fsready else { errormsg = "沙箱未逃逸且 VFS 未就绪。"; return }
 
-        if bundledSize(app) > 200 * 1024 * 1024 {
-            Alertinator.shared.alert(
-                title: "大型应用",
-                body: "该应用超过 200 MB，砸壳可能需要较长时间。",
-                actionLabel: "继续",
-                action: { self.runDecrypt(app) }
-            )
-            return
+        // 体积枚举放后台：大 App 递归 stat 整个 bundle 要好几秒，不能占主线程
+        DispatchQueue.global(qos: .userInitiated).async {
+            let size = bundledSize(app)
+            DispatchQueue.main.async {
+                guard decryptingbid == nil && pendingdecrypt == nil else { return }
+                if size > 200 * 1024 * 1024 {
+                    Alertinator.shared.alert(
+                        title: "大型应用",
+                        body: "该应用体积 \(byteString(size))，砸壳可能需要较长时间，请保持屏幕常亮。",
+                        actionLabel: "继续",
+                        action: { self.runDecrypt(app, sourceBytes: size) }
+                    )
+                } else {
+                    self.runDecrypt(app, sourceBytes: size)
+                }
+            }
         }
-        runDecrypt(app)
     }
 
     // self-signed / sideloaded apps are not FairPlay-encrypted, so there is nothing
@@ -771,21 +808,28 @@ struct DecryptView: View {
         guard !busy && pendingdecrypt == nil else { return }
         guard fsready else { errormsg = "沙箱未逃逸且 VFS 未就绪。"; return }
 
-        if bundledSize(app) > 200 * 1024 * 1024 {
-            Alertinator.shared.alert(
-                title: "大型应用",
-                body: "该应用超过 200 MB，提取可能需要较长时间。",
-                actionLabel: "继续",
-                action: { self.runExtract(app) }
-            )
-            return
+        DispatchQueue.global(qos: .userInitiated).async {
+            let size = bundledSize(app)
+            DispatchQueue.main.async {
+                guard !busy && pendingdecrypt == nil else { return }
+                if size > 200 * 1024 * 1024 {
+                    Alertinator.shared.alert(
+                        title: "大型应用",
+                        body: "该应用体积 \(byteString(size))，提取可能需要较长时间，请保持屏幕常亮。",
+                        actionLabel: "继续",
+                        action: { self.runExtract(app, sourceBytes: size) }
+                    )
+                } else {
+                    self.runExtract(app, sourceBytes: size)
+                }
+            }
         }
-        runExtract(app)
     }
 
-    func runExtract(_ app: DecryptApp) {
+    func runExtract(_ app: DecryptApp, sourceBytes: Int64 = 0) {
         errormsg = nil
         extractingbid = app.bundleID
+        DecryptProgress.shared.begin(sourceBytes: sourceBytes)
 
         let appName = (app.bundlePath as NSString).lastPathComponent
         let ipaName = app.name
@@ -801,7 +845,11 @@ struct DecryptView: View {
 
         AppDumpmgr.shared.logmsg("(extract) \(app.bundleID) is not encrypted, copying bundle...")
 
+        // 整个拷贝/打包期间持有后台断言，锁屏或切后台不会把任务挂起
+        let assertion = BackgroundAssertion("AppDumpExtract")
+
         DispatchQueue.global(qos: .userInitiated).async {
+            defer { assertion.end() }
             let fm = FileManager.default
 
             try? fm.removeItem(atPath: workDir)
@@ -816,6 +864,7 @@ struct DecryptView: View {
             if !mgr.sbxready {
                 let cr = vfsfs.copytree(from: app.bundlePath, to: destAppPath)
                 AppDumpmgr.shared.logmsg("(copy) vfs: \(cr.files) files / \(cr.bytes) bytes, failed \(cr.failed)")
+                DecryptProgress.shared.endCopy()
             } else {
             guard let enumerator = fm.enumerator(atPath: app.bundlePath) else {
                 DispatchQueue.main.async {
@@ -826,6 +875,7 @@ struct DecryptView: View {
                 return
             }
 
+            var copiedBytes: Int64 = 0
             for case let subpath as String in enumerator {
                 let src = (app.bundlePath as NSString).appendingPathComponent(subpath)
                 let dst = (destAppPath as NSString).appendingPathComponent(subpath)
@@ -840,8 +890,12 @@ struct DecryptView: View {
                         // 个别文件被系统拒绝时跳过并记录，不能让整个提取失败
                         AppDumpmgr.shared.logmsg("(extract) copy skipped \(subpath): \(error.localizedDescription)")
                     }
+                    let sz = ((try? fm.attributesOfItem(atPath: dst))?[.size] as? NSNumber)?.int64Value ?? 0
+                    copiedBytes += sz
+                    DecryptProgress.shared.updateCopy(done: copiedBytes, total: sourceBytes)
                 }
             }
+            DecryptProgress.shared.endCopy()
             }
 
             guard fm.fileExists(atPath: destAppPath + "/" + app.executable) else {
@@ -872,12 +926,15 @@ struct DecryptView: View {
                 return
             }
 
+            DecryptProgress.shared.setStage("打包 ipa…")
             do {
                 try createZipArchive(
                     fromDirectory: URL(fileURLWithPath: workDir, isDirectory: true),
-                    to: URL(fileURLWithPath: ipaPath)
+                    to: URL(fileURLWithPath: ipaPath),
+                    progress: { f in DecryptProgress.shared.updatePack(f) }
                 )
             } catch {
+                DecryptProgress.shared.abort()
                 DispatchQueue.main.async {
                     extractingbid = nil
                     errormsg = "生成 ipa 失败：\(error.localizedDescription)"
@@ -887,6 +944,7 @@ struct DecryptView: View {
             }
 
             try? fm.removeItem(atPath: workDir)
+            DecryptProgress.shared.finish()
 
             DispatchQueue.main.async {
                 extractingbid = nil
@@ -908,13 +966,14 @@ struct DecryptView: View {
         }
     }
 
-    func runDecrypt(_ app: DecryptApp) {
+    func runDecrypt(_ app: DecryptApp, sourceBytes: Int64 = 0) {
         errormsg = nil
         decryptingbid = app.bundleID
+        DecryptProgress.shared.begin(sourceBytes: sourceBytes)
 
         let pid = find_process_pid(app.executable)
         if pid > 0 {
-            doDecrypt(app, pid: pid)
+            doDecrypt(app, pid: pid, sourceBytes: sourceBytes)
         } else {
             pendingdecrypt = app
 
@@ -941,7 +1000,7 @@ struct DecryptView: View {
                     let foundPid = find_process_pid(app.executable)
                     if foundPid > 0 {
                         DispatchQueue.main.async {
-                            self.doDecrypt(app, pid: foundPid)
+                            self.doDecrypt(app, pid: foundPid, sourceBytes: sourceBytes)
                         }
                     } else {
                         DispatchQueue.main.async {
@@ -958,7 +1017,7 @@ struct DecryptView: View {
         }
     }
 
-    func doDecrypt(_ app: DecryptApp, pid: pid_t) {
+    func doDecrypt(_ app: DecryptApp, pid: pid_t, sourceBytes: Int64 = 0) {
         let appName = (app.bundlePath as NSString).lastPathComponent
         let ipaName = app.name
             .replacingOccurrences(of: " ", with: "")
@@ -972,10 +1031,19 @@ struct DecryptView: View {
 
         AppDumpmgr.shared.logmsg("(decrypt) decrypting \(app.bundleID)...")
 
+        // 整段任务（拷贝 → 逐页解密 → 打包）都要有后台断言，否则锁屏即挂起
+        let assertion = BackgroundAssertion("AppDumpKernelDecrypt")
+
         DispatchQueue.global(qos: .userInitiated).async {
+            defer { assertion.end() }
             let fm = FileManager.default
 
-            if let spaceErr = checkDiskSpace(app) {
+            // 体积优先用调用方算好的；没传（例如从 didBecomeActive 直接续跑）就在这里补算，
+            // 反正这段已经在后台队列上了
+            let sourceTotal = sourceBytes > 0 ? sourceBytes : bundledSize(app)
+            DecryptProgress.shared.begin(sourceBytes: sourceTotal)
+
+            if let spaceErr = checkDiskSpace(bytes: sourceTotal) {
                 DispatchQueue.main.async {
                     decryptingbid = nil
                     errormsg = spaceErr
@@ -994,6 +1062,7 @@ struct DecryptView: View {
             if !mgr.sbxready {
                 let cr = vfsfs.copytree(from: app.bundlePath, to: destAppPath)
                 AppDumpmgr.shared.logmsg("(copy) vfs: \(cr.files) files / \(cr.bytes) bytes, failed \(cr.failed)")
+                DecryptProgress.shared.endCopy()
             } else {
             guard let enumerator = fm.enumerator(atPath: app.bundlePath) else {
                 DispatchQueue.main.async {
@@ -1004,6 +1073,7 @@ struct DecryptView: View {
                 return
             }
 
+            var copiedBytes: Int64 = 0
             for case let subpath as String in enumerator {
                 let src = (app.bundlePath as NSString).appendingPathComponent(subpath)
                 let dst = (destAppPath as NSString).appendingPathComponent(subpath)
@@ -1018,15 +1088,24 @@ struct DecryptView: View {
                         // 个别文件被系统拒绝时跳过并记录，不能让整个砸壳失败
                         AppDumpmgr.shared.logmsg("(decrypt) copy skipped \(subpath): \(error.localizedDescription)")
                     }
+                    let sz = ((try? fm.attributesOfItem(atPath: dst))?[.size] as? NSNumber)?.int64Value ?? 0
+                    copiedBytes += sz
+                    DecryptProgress.shared.updateCopy(done: copiedBytes, total: sourceTotal)
                 }
             }
+            DecryptProgress.shared.endCopy()
             }
 
             AppDumpmgr.shared.logmsg("(copy) done")
 
             let mainBinary = destAppPath + "/" + app.executable
+            // 主程序占 0.30→0.62，其余附属 Mach-O 均分 0.62→0.88
+            DecryptProgress.shared.beginBinary("解密主二进制…",
+                                              base: DecryptProgress.copyEnd,
+                                              span: 0.32)
             let mainRet = decrypt_binary_pid((app.bundlePath + "/" + app.executable), pid, mainBinary)
             guard mainRet == 0 else {
+                DecryptProgress.shared.abort()
                 DispatchQueue.main.async {
                     decryptingbid = nil
                     errormsg = "主二进制解密失败"
@@ -1041,7 +1120,9 @@ struct DecryptView: View {
             // 扩展（.appex）跑在自己的进程里，宿主 pid 匹配不上它的 LC_UUID，
             // 所以用 decrypt_binary_search：先试宿主 pid，失败再遍历所有进程。
             let mainBinURL = URL(fileURLWithPath: mainBinary)
-            var subDecrypted = 0, subFailed = 0
+            // 先把候选列出来，才知道每份二进制该占进度条的多少；以前是边走边解，
+            // 进度只能给个含糊的百分比
+            var subs: [String] = []
             for rel in (fm.subpaths(atPath: destAppPath) ?? []) {
                 let full = (destAppPath as NSString).appendingPathComponent(rel)
                 var isDir: ObjCBool = false
@@ -1055,6 +1136,21 @@ struct DecryptView: View {
                     || rel.contains(".appex/")
                 if !candidate { continue }
                 if is_encrypted_path(full) <= 0 { continue }
+                subs.append(full)
+            }
+
+            var subDecrypted = 0, subFailed = 0
+            let subBase = 0.62
+            let subSpan = DecryptProgress.pagesEnd - subBase
+            for (idx, full) in subs.enumerated() {
+                let rel = String(full.dropFirst(destAppPath.count + 1))
+                // 每份二进制分到自己的小格；C 回调的 0…1 只映射到这一格，
+                // 且整体只增不减，所以不会出现"解下一个文件时进度倒退"
+                DecryptProgress.shared.beginBinary(
+                    "解密 \(rel)（\(idx + 1)/\(subs.count)）",
+                    base: subBase + subSpan * Double(idx) / Double(max(subs.count, 1)),
+                    span: subSpan / Double(max(subs.count, 1))
+                )
 
                 if decrypt_binary_search(full, pid, full) != 0 {
                     // 空闲的 .appex 没有进程在跑，读不到解密页
@@ -1088,12 +1184,15 @@ struct DecryptView: View {
                 return
             }
 
+            DecryptProgress.shared.setStage("打包 ipa…")
             do {
                 try createZipArchive(
                     fromDirectory: URL(fileURLWithPath: workDir, isDirectory: true),
-                    to: URL(fileURLWithPath: ipaPath)
+                    to: URL(fileURLWithPath: ipaPath),
+                    progress: { f in DecryptProgress.shared.updatePack(f) }
                 )
             } catch {
+                DecryptProgress.shared.abort()
                 DispatchQueue.main.async {
                     decryptingbid = nil
                     errormsg = "生成 ipa 失败：\(error.localizedDescription)"
@@ -1103,6 +1202,7 @@ struct DecryptView: View {
             }
 
             try? fm.removeItem(atPath: workDir)
+            DecryptProgress.shared.finish()
 
             DispatchQueue.main.async {
                 decryptingbid = nil

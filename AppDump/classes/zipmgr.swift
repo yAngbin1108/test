@@ -431,7 +431,9 @@ private struct zipPendingEntry {
     let size: UInt64
 }
 
-public func createZipArchive(fromDirectory sourceURL: URL, to destinationURL: URL, compressionMethod: UInt16 = 0) throws {
+public func createZipArchive(fromDirectory sourceURL: URL, to destinationURL: URL,
+                             compressionMethod: UInt16 = 0,
+                             progress: ((Double) -> Void)? = nil) throws {
     let mgr = AppDumpmgr.shared
     let fm = FileManager.default
     let resolvedSource = sourceURL.resolvingSymlinksInPath()
@@ -477,12 +479,20 @@ public func createZipArchive(fromDirectory sourceURL: URL, to destinationURL: UR
     var cdRows: [Data] = []
     var writtenEntries: UInt64 = 0
 
+    // 进度只统计「文件载荷」的字节数，和 totalBytes 的口径一致；
+    // 每穿过 32MB 台阶报一次，避免大包时进度条一格一格跳。
+    var payloadDone: UInt64 = 0
+    var payloadReported: UInt64 = 0
+    let progressStep: UInt64 = 32 * 1024 * 1024
+
     func writeLocalHeader(nameData: Data, crc: UInt32, size: UInt64, offset: UInt64) throws -> UInt64 {
         let needZip64Value = size >= zipU32Max
         var lfh = Data()
         writeLE32(lfhSignature, to: &lfh)
         writeLE16(needZip64Value ? 45 : 20, to: &lfh)          // version needed
-        writeLE16(0, to: &lfh)                                  // flags
+        // 0x0800 = 文件名按 UTF-8 解释。以前写的是 0，带中文/emoji 的
+        // 资源名在部分解压器（Windows 自带、部分在线工具）里会乱码。
+        writeLE16(0x0800, to: &lfh)                             // flags
         writeLE16(compressionMethod, to: &lfh)
         writeLE16(0, to: &lfh)                                  // time
         writeLE16(0, to: &lfh)                                  // date
@@ -533,19 +543,45 @@ public func createZipArchive(fromDirectory sourceURL: URL, to destinationURL: UR
                 crc = crc32Update(crc, chunk)
                 try fh.write(contentsOf: chunk)
                 written += UInt64(chunk.count)
+
+                payloadDone += UInt64(chunk.count)
+                if let progress, totalBytes > 0, payloadDone - payloadReported >= progressStep {
+                    payloadReported = payloadDone
+                    progress(min(Double(payloadDone) / Double(totalBytes), 1.0))
+                }
             }
         } catch {
             mgr.logmsg("(zip) read failed \(entry.name): \(error.localizedDescription)")
             throw error
         }
 
-        // 数据写完，回填 CRC + 真实尺寸（大小可能和 stat 有偏差）
+        // 数据写完，回填 CRC + 真实尺寸（stat 的大小可能和实际读出的不一致）
+        //
+        // ZIP64 的坑：本地头是否带 ZIP64 扩展是「写头之前」用 stat 大小决定的，
+        // 如果 stat 偏小、实际写到 ≥4GB，32 位字段根本装不下。以前这里只在
+        // 32 位字段里塞 0xFFFFFFFF 就完事，64 位扩展里留的还是占位值 → 包坏。
+        // 现在：真的越界就报错不硬凑，并把 64 位字段一起回填。
+        if written >= zipU32Max && entry.size < zipU32Max {
+            let e = "(zip) \(entry.name) 实际大小 \(written) ≥4GB，但 stat 报 \(entry.size)，本地头没有 ZIP64 扩展可回填"
+            mgr.logmsg(e)
+            throw ZipError.corruptArchive(e)
+        }
+
         var patch = Data()
         writeLE32(crc, to: &patch)
         writeLE32(entry.size >= zipU32Max ? 0xFFFF_FFFF : UInt32(written), to: &patch)
         writeLE32(entry.size >= zipU32Max ? 0xFFFF_FFFF : UInt32(written), to: &patch)
         _ = try fh.seek(toOffset: headerPos + 14)
         try fh.write(contentsOf: patch)
+
+        if entry.size >= zipU32Max {
+            // 本地头布局：30 字节固定头 + 文件名 + 4 字节扩展头(id/长度) + usize/csize
+            var sizes = Data()
+            writeLE64(written, to: &sizes)
+            writeLE64(written, to: &sizes)
+            _ = try fh.seek(toOffset: headerPos + 30 + UInt64(nameData.count) + 4)
+            try fh.write(contentsOf: sizes)
+        }
         _ = try fh.seekToEnd()
 
         cdRows.append(makeCentralRow(name: nameData, crc: crc, size: written, offset: offset,
@@ -598,6 +634,9 @@ public func createZipArchive(fromDirectory sourceURL: URL, to destinationURL: UR
     try fh.write(contentsOf: eocd)
 
     let finalSize = (try? fh.offset()) ?? 0
+    // 落盘再报完成：大包写完后立刻弹分享/被杀，未 flush 的部分会丢
+    try? fh.synchronize()
+    progress?(1.0)
     mgr.logmsg("(zip) done: \(finalSize / (1024 * 1024)) MB, \(writtenEntries) entries")
 }
 
@@ -610,7 +649,7 @@ private func makeCentralRow(name: Data, crc: UInt32, size: UInt64, offset: UInt6
     writeLE32(cdSignature, to: &cd)
     writeLE16(needZip64Value ? 45 : 20, to: &cd)     // version made by
     writeLE16(needZip64Value ? 45 : 20, to: &cd)     // version needed
-    writeLE16(0, to: &cd)
+    writeLE16(0x0800, to: &cd)                       // flags：UTF-8 文件名
     writeLE16(method, to: &cd)
     writeLE16(0, to: &cd)
     writeLE16(0, to: &cd)
