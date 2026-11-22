@@ -132,14 +132,26 @@ enum FPBundleAudit {
             // 只说事实：这份副本没有签名、正文状态如何。
             // 不再断言「是谁改的」——用户可能在 App Store 里点下载，但真正落地的
             // 字节被设备上的签名工具/主题工具/安装助手改过，这从包里看不出来。
-            log("（体检）结论：这份副本**没有签名**（无 CodeDirectory），正文"
-                + "\(sample.isPlain ? "是明文" : "仍是密文")"
-                + (sample.isPlain
-                   ? " ⇒ 它与商店原包不再一致，但也**不需要砸壳**：正文本来就能读，"
-                     + "AppDump 会直接清掉 cryptid 按明文出包。"
-                   : " ⇒ 加密且无签名，属于半残包，建议改用 A · 内核砸壳。")
-                + "\n（体检）如果要干净的原厂字节：App Store 里删掉这个应用再重新下载，"
-                + "并且全程不要经过任何签名/主题/安装助手工具。")
+            // 结论只陈述读到的字节，不猜是谁改的：
+            // 容器结构（iTunesMetadata / BundleMetadata / CodeResources）是商店安装的样子，
+            // 变的是**主程序这一份字节**——签名段被清零、加密区只剩一页、正文是明文。
+            var text = "（体检）结论：主程序**没有签名**（无 CodeDirectory"
+            if facts.csHeadAllZero && facts.csSize > 0 {
+                text += "，签名段被清零、长度仍在"
+            } else if !facts.hasCSCommand {
+                text += "，连 LC_CODE_SIGNATURE 都被删了"
+            }
+            text += "），正文" + (sample.isPlain ? "是明文" : "仍是密文")
+            if sample.isPlain {
+                text += " ⇒ 主程序这份字节被动过，但它**不需要砸壳**：正文本来就能读，"
+                    + "AppDump 会直接清掉 cryptid 按明文出包。"
+            } else {
+                text += " ⇒ 加密且无签名，属于半残包，建议改用 A · 内核砸壳。"
+            }
+            text += "\n（体检）包结构（iTunesMetadata / 容器元数据 / CodeResources）是商店安装的样子，"
+                + "变的只有主程序这份字节；要原厂字节只能让 App Store 重新下载，"
+                + "并确保中途没有任何签名/主题/安装助手工具介入。"
+            log(text)
         } else {
             log("（体检）结论：\(sample.verdict)")
         }
@@ -179,17 +191,18 @@ enum FPBundleAudit {
 
         if let installDir, installDir.path != appDir.path {
             dump("安装目录", installDir)
-            // 判读：商店网络安装会把文件写成安装时刻；文件 mtime 比容器创建早很多，
-            // 说明这些字节来自一个更早打好的包（本地 IPA / 助手 / 旧副本覆盖安装）。
+            // 注意：App Store 安装会**原样保留**包内文件的 mtime（那是上游打包时间），
+            // 所以「主程序 mtime 早于容器创建」既不能证明也不能否定是不是商店装的。
+            // 来源要看签名结构，时间线只用来看「装完之后有没有再被写过」。
             let container = installDir.deletingLastPathComponent()
             if let created = (try? manager.attributesOfItem(atPath: container.path))?[.creationDate] as? Date,
                let exeName = bundleExecutable(installDir),
                let exeDate = date(installDir.appendingPathComponent(exeName)),
                created.timeIntervalSince(exeDate) > 3600 {
                 let hours = created.timeIntervalSince(exeDate) / 3600
-                log(String(format: "（体检）判读：主程序 mtime 比容器创建早 %.0f 小时 ⇒ "
-                           + "这些字节来自一个更早打包好的 IPA（商店网络安装会写成安装时刻），"
-                           + "不是本次下载刚解出来的原厂字节", hours))
+                log(String(format: "（体检）时间线：主程序 mtime 比容器创建早 %.0f 小时 "
+                           + "—— 这是上游打包时间（商店安装会原样保留 mtime，不能据此判断来源）；"
+                           + "容器创建时间才是这次安装的时刻，之后若有改动会体现为更晚的 mtime", hours))
             }
             dump("暂存副本", appDir)
         } else {
@@ -214,6 +227,10 @@ enum FPBundleAudit {
         var csSize: UInt64 = 0
         var superblobMagic: UInt32?
         var blobTypes: [UInt32] = []
+        /// 签名段开头 16 字节的十六进制，以及「这 4 KB 是不是全 0」。
+        var csHeadHex = ""
+        var csHeadBytes = 0
+        var csHeadAllZero = false
 
         private static func blobName(_ type: UInt32) -> String {
             switch type {
@@ -252,8 +269,13 @@ enum FPBundleAudit {
                 }
             } else if let magic = superblobMagic {
                 text += String(format: " · blob 魔数 0x%x 不是 embedded-signature superblob", magic)
+            } else if csHeadBytes > 0 {
+                text += " · CS 区首 \(csHeadBytes) 字节：\(csHeadHex)"
+                text += csHeadAllZero
+                    ? " ⇒ 签名段被**清零**了（长度还在、内容没了，这是改包工具的做法）"
+                    : " ⇒ 开头不是 superblob 魔数，签名内容被替换过"
             } else {
-                text += " · blob 读不到（csSize 太小或越界）"
+                text += " · 签名段读不到（文件不完整？）"
             }
             text += hasCodeDirectory ? " · 有 CodeDirectory" : " · 没有 CodeDirectory"
             return text
@@ -384,6 +406,12 @@ enum FPBundleAudit {
             position += Int(cmdsize)
         }
 
+        if let csOffset, csSize > 0, let head = readAt(handle, csOffset, Int(min(csSize, 4096))) {
+            facts.csHeadBytes = head.count
+            let prefix = head.prefix(16)
+            facts.csHeadHex = prefix.map { String(format: "%02x", $0) }.joined(separator: " ")
+            facts.csHeadAllZero = !head.isEmpty && head.allSatisfy { $0 == 0 }
+        }
         if let csOffset, csSize > 12, let blob = readAt(handle, csOffset, Int(min(csSize, 128 * 1024))) {
             if let magicSb = u32(blob, 0), magicSb == 0xFADE_0CC0 || magicSb == 0xFADE_0CC1 {
                 facts.superblobMagic = magicSb
