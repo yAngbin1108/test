@@ -14,9 +14,11 @@ enum FPBundleAudit {
 
     static func run(appDir: URL,
                     rows: [(path: String, slices: [FPMachO.Slice])],
+                    installDir: URL? = nil,
                     log: @escaping (String) -> Void) {
         let manager = FileManager.default
-        log("（体检）目录：\(appDir.lastPathComponent)")
+        log("（体检）目录：\(appDir.lastPathComponent)"
+            + (installDir.map { "（暂存副本；原始安装目录 \($0.lastPathComponent)）" } ?? ""))
 
         // 1. 描述文件
         let profile = appDir.appendingPathComponent("embedded.mobileprovision")
@@ -31,34 +33,46 @@ enum FPBundleAudit {
 
         // 2. iTunes 元数据
         // iOS 17 起商店把 iTunesMetadata.plist 写在**容器目录**（.app 的父目录）里，
-        // 老版本才放在 .app 内。只看包内会把正常包误判成「元数据被删」。
-        let container = appDir.deletingLastPathComponent()
+        // 老版本才放在 .app 内。两个位置、两套目录（暂存副本 + 原始安装目录）都要查：
+        // 暂存拷贝可能漏文件，原始安装目录才是真相。
         var metaHits: [String] = []
-        for candidate in [appDir.appendingPathComponent("iTunesMetadata.plist"),
-                          container.appendingPathComponent("iTunesMetadata.plist")] {
-            guard let attrs = try? manager.attributesOfItem(atPath: candidate.path),
-                  let size = attrs[.size] as? NSNumber else { continue }
-            let place = candidate.deletingLastPathComponent() == appDir ? "包内" : "容器目录"
-            metaHits.append("\(place) \(size.intValue) B")
+        var metaSeenInInstall = false, metaSeenInStage = false
+        var locations: [(String, URL)] = [("暂存", appDir)]
+        if let installDir, installDir.path != appDir.path { locations.append(("安装目录", installDir)) }
+        for (label, dir) in locations {
+            for (place, candidate) in [("包内", dir.appendingPathComponent("iTunesMetadata.plist")),
+                                       ("容器目录", dir.deletingLastPathComponent()
+                                                     .appendingPathComponent("iTunesMetadata.plist"))] {
+                guard let attrs = try? manager.attributesOfItem(atPath: candidate.path),
+                      let size = attrs[.size] as? NSNumber else { continue }
+                metaHits.append("\(label)/\(place) \(size.intValue) B")
+                if label == "安装目录" { metaSeenInInstall = true } else { metaSeenInStage = true }
+            }
         }
         if metaHits.isEmpty {
             log("（体检）iTunesMetadata.plist：包内与容器目录都没有（商店包一般有，重签/改壳常被删）")
         } else {
             log("（体检）iTunesMetadata.plist：有（" + metaHits.joined(separator: "、") + "）")
-        }
-        var containerMarks: [String] = []
-        for name in ["BundleMetadata.plist", ".com.apple.mobile_container_manager.metadata.plist"] {
-            if manager.fileExists(atPath: container.appendingPathComponent(name).path) {
-                containerMarks.append(name)
+            if metaSeenInInstall && !metaSeenInStage {
+                log("（体检）注意：安装目录里有、暂存副本里没有 ⇒ 是拷贝漏了，不是被删")
             }
         }
-        if !containerMarks.isEmpty {
-            log("（体检）容器元数据：有（" + containerMarks.joined(separator: "、") + "）"
-                + " ⇒ 这个容器是 installd 建的（不是手工拷进来的目录）")
+        for (label, dir) in locations {
+            let container = dir.deletingLastPathComponent()
+            var marks: [String] = []
+            for name in ["BundleMetadata.plist", ".com.apple.mobile_container_manager.metadata.plist"] {
+                if manager.fileExists(atPath: container.appendingPathComponent(name).path) {
+                    marks.append(name)
+                }
+            }
+            if !marks.isEmpty {
+                log("（体检）容器元数据（\(label)）：有（" + marks.joined(separator: "、") + "）"
+                    + " ⇒ 这个容器是 installd 建的（不是手工拷进来的目录）")
+            }
         }
 
         // 2b. 时间线：区分「拷进设备时就是这样」和「装完之后被改的」
-        logTimes(appDir: appDir, log: log)
+        logTimes(appDir: appDir, installDir: installDir, log: log)
 
         // 3. 签名封条
         let resources = appDir.appendingPathComponent("_CodeSignature/CodeResources")
@@ -74,7 +88,16 @@ enum FPBundleAudit {
             log("（体检）读不到 CFBundleExecutable，跳过签名检查")
             return
         }
-        let exe = appDir.appendingPathComponent(exeName)
+        // 主程序优先读原始安装目录里的那一份：暂存副本可能是拷贝出问题的那一份，
+        // 「签名段越界」这类结论必须基于原始字节。
+        var exe = appDir.appendingPathComponent(exeName)
+        if let installDir {
+            let original = installDir.appendingPathComponent(exeName)
+            if manager.fileExists(atPath: original.path) {
+                exe = original
+                log("（体检）主程序读取自：原始安装目录（避开暂存副本）")
+            }
+        }
         guard let facts = binaryFacts(exe) else {
             log("（体检）主程序 \(exeName)：Mach-O 解析失败"
                 + (manager.fileExists(atPath: exe.path) ? "" : "（文件不存在）"))
@@ -125,33 +148,52 @@ enum FPBundleAudit {
     // MARK: - 时间线
 
     /// 打印能回答「谁改的、什么时候改的」的时间戳。
-    /// 容器目录的创建时间≈安装时间；各文件 mtime 晚于它就是装完之后又被改过。
-    private static func logTimes(appDir: URL, log: @escaping (String) -> Void) {
+    /// 只看暂存副本没意义（那一层的目录是刚创建的），所以按「安装目录」和
+    /// 「暂存副本」分别打，并且明确标注哪一行是安装容器。
+    private static func logTimes(appDir: URL, installDir: URL?, log: @escaping (String) -> Void) {
         let manager = FileManager.default
-        let parent = appDir.deletingLastPathComponent()
+        let big = DateFormatter()
+        big.dateFormat = "MM-dd HH:mm:ss"
+        func date(_ url: URL) -> Date? {
+            (try? manager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        }
         func stamp(_ url: URL) -> String {
             guard let attrs = try? manager.attributesOfItem(atPath: url.path) else { return "读不到" }
             let modified = attrs[.modificationDate] as? Date
             let created = attrs[.creationDate] as? Date
-            let big = DateFormatter()
-            big.dateFormat = "MM-dd HH:mm:ss"
             let text = modified.map { big.string(from: $0) } ?? "—"
             if let created, let modified, abs(created.timeIntervalSince(modified)) > 60 {
                 return text + "（创建 " + big.string(from: created) + "）"
             }
             return text
         }
-        let install = stamp(parent)
-        log("（体检）时间线：安装/容器 \(install) · .app \(stamp(appDir))"
-            + " · Info.plist \(stamp(appDir.appendingPathComponent("Info.plist")))"
-            + " · _CodeSignature \(stamp(appDir.appendingPathComponent("_CodeSignature/CodeResources")))")
-        if let exeName = bundleExecutable(appDir) {
-            log("（体检）时间线：主程序 \(exeName) \(stamp(appDir.appendingPathComponent(exeName)))")
+        func dump(_ label: String, _ dir: URL) {
+            let container = dir.deletingLastPathComponent()
+            log("（体检）时间线（\(label)）：容器 \(stamp(container)) · .app \(stamp(dir))"
+                + " · Info.plist \(stamp(dir.appendingPathComponent("Info.plist")))"
+                + " · _CodeSignature \(stamp(dir.appendingPathComponent("_CodeSignature/CodeResources")))")
+            if let exeName = bundleExecutable(dir) {
+                log("（体检）时间线（\(label)）：主程序 \(exeName) \(stamp(dir.appendingPathComponent(exeName)))")
+            }
         }
-        // 兄弟目录里就能看出还有多少别的应用是同一种形状，不是判断依据，纯参考。
-        let meta = appDir.appendingPathComponent("iTunesMetadata.plist")
-        if manager.fileExists(atPath: meta.path) {
-            log("（体检）时间线：iTunesMetadata.plist \(stamp(meta))")
+
+        if let installDir, installDir.path != appDir.path {
+            dump("安装目录", installDir)
+            // 判读：商店网络安装会把文件写成安装时刻；文件 mtime 比容器创建早很多，
+            // 说明这些字节来自一个更早打好的包（本地 IPA / 助手 / 旧副本覆盖安装）。
+            let container = installDir.deletingLastPathComponent()
+            if let created = (try? manager.attributesOfItem(atPath: container.path))?[.creationDate] as? Date,
+               let exeName = bundleExecutable(installDir),
+               let exeDate = date(installDir.appendingPathComponent(exeName)),
+               created.timeIntervalSince(exeDate) > 3600 {
+                let hours = created.timeIntervalSince(exeDate) / 3600
+                log(String(format: "（体检）判读：主程序 mtime 比容器创建早 %.0f 小时 ⇒ "
+                           + "这些字节来自一个更早打包好的 IPA（商店网络安装会写成安装时刻），"
+                           + "不是本次下载刚解出来的原厂字节", hours))
+            }
+            dump("暂存副本", appDir)
+        } else {
+            dump("暂存副本", appDir)
         }
     }
 
@@ -191,8 +233,18 @@ enum FPBundleAudit {
             guard hasCSCommand else {
                 return "没有 LC_CODE_SIGNATURE 命令 ⇒ 整段签名（含 CodeDirectory）被删掉了"
             }
-            var text = String(format: "LC_CODE_SIGNATURE off=0x%llx size=0x%llx", csOffset, csSize)
+            var text = String(format: "LC_CODE_SIGNATURE off=0x%llx size=0x%llx · 文件 0x%llx",
+                              csOffset, csSize, fileSize)
             if csSize == 0 { return text + "，size=0（空签名）" }
+            if csOffset >= fileSize || csOffset + csSize > fileSize {
+                // 签名段指向文件末尾之外：字节被切掉了（典型的「剥签名」做法是
+                // 直接把文件尾部裁掉，却忘了把这条 load command 清零）。
+                let want = csOffset + csSize
+                let excess = want > fileSize ? want - fileSize : 0
+                text += String(format: " ⇒ 越界 0x%llx 字节，签名段被切掉了"
+                              + "（文件尾部缺失，不是我们读不到）", excess)
+                return text
+            }
             if let magic = superblobMagic, magic == 0xFADE_0CC0 || magic == 0xFADE_0CC1 {
                 text += String(format: " · superblob 0x%x，%d 个 blob", magic, blobTypes.count)
                 if !blobTypes.isEmpty {

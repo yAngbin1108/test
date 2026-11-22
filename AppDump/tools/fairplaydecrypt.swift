@@ -891,9 +891,16 @@ enum FPVerifier {
             guard contentChecked < contentSample else { continue }
 
             if let slice = slices.first(where: { $0.cryptsize > 0 }) {
-                let start = slice.sliceOffset + slice.cryptoff
-                guard start < size else { continue }
-                let length = min(slice.cryptsize, size - start)
+                var start = slice.sliceOffset + slice.cryptoff
+                var length = min(slice.cryptsize, size - start)
+                // 假加密壳（声明区间只有一页）那里是留给内核的残渣，本来就是密文，
+                // 拿它判「不像明文」等于把我们已经如实告警过的东西当失败。改采样正文。
+                if slice.cryptsize <= 0x4000 {
+                    start = slice.sliceOffset + slice.cryptoff + UInt64(slice.cryptsize)
+                    if start >= size { start = slice.sliceOffset }
+                    length = min(0x10000, size - start)
+                }
+                guard start < size, length > 0 else { continue }
                 let stats = FPCodeStats()
                 try reader.stream(entry, from: start, length: length) { pointer, count, _ in
                     stats.feed(pointer, count)
@@ -1108,7 +1115,7 @@ enum FPDecryptor {
         log("Mach-O \(inventory.count) 个，其中加密 \(encryptedFiles.count) 个；SINF 补齐 \(sinfCopied) 个")
 
         // 体检：这个包到底是商店原包，还是被解过/改过壳的包。
-        FPBundleAudit.run(appDir: appDir, rows: inventory, log: log)
+        FPBundleAudit.run(appDir: appDir, rows: inventory, installDir: originalAppDir, log: log)
 
         var encryptedKeys = Set<String>()
         for row in encryptedFiles { encryptedKeys.insert(appPrefix + row.path) }
