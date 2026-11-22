@@ -423,9 +423,15 @@ final class downgrademgr {
                                     reason: "选中的版本 ID 没能通过校验。",
                                     advice: "换一个版本再试；如果版本来源里出现「未知版本」，先到「版本来源」里换一个能给出正确版本号的源。")
         case 20:
+            let why = kcd_last_attach_error() ?? ""
+            let kernelReady = ds_is_ready()
             return downgradefailure(kind: .kernel, title: "无法附着 SpringBoard",
-                                    reason: "模式 B 需要把代码注入 SpringBoard 才能复用商店的购买流程。",
-                                    advice: "到「内核」页运行漏洞利用并初始化系统，然后重试。")
+                                    reason: why.isEmpty
+                                        ? "模式 B 需要把代码注入 SpringBoard 才能复用商店的购买流程。"
+                                        : "模式 B 需要把代码注入 SpringBoard，这次注入失败：\(why)",
+                                    advice: kernelReady
+                                        ? "内核读写是就绪的，问题出在注入这一环（上面那句具体原因）。先重试一次；如果每次原因都一样，说明这套系统（\(ProcessInfo.processInfo.operatingSystemVersionString)）上的注入方式不适配，换版本得等适配。"
+                                        : "到「内核」页运行漏洞利用并初始化系统，然后重试。")
         case 21, 22, 23:
             return downgradefailure(kind: .storekit, title: "SpringBoard 里加载 StoreKitUI 失败",
                                     reason: "目标进程里没能取到 SKUIClientContext / SKUIItem 这些私有类。",
