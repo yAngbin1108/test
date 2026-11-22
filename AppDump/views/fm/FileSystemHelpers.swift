@@ -93,6 +93,13 @@ enum santanderfs {
         guard exists, isdir.boolValue else {
             return santanderlisting(items: [], empty: "目录已不存在。")
         }
+        // 进目录前探一次：上一次写/删很可能已经把沙盒策略冲掉了，表现就是
+        // 「明明刚才能进，现在提示没有权限」。被拒就修一次再重试（探针通过时
+        // 是零内核写，只有真丢了才重放那一次策略写）。
+        if !fm.isReadableFile(atPath: item.path) {
+            AppDumpmgr.shared.logmsg("[fm] 列目录被拒，恢复写权限后重试: \(item.path)")
+            _ = SandboxKeeper.shared.ensureWriteAccess()
+        }
         guard fm.isReadableFile(atPath: item.path) else {
             return santanderlisting(items: [], empty: "Cannot list directory (missing permissions).")
         }
