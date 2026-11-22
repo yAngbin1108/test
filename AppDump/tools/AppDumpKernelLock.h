@@ -13,10 +13,18 @@
 
 #import <Foundation/Foundation.h>
 
-static inline NSLock *AppDumpKernelLock(void) {
-    static NSLock *lock;
+/*
+ * 必须是递归锁。
+ *
+ * 属主修复会在持锁状态下遍历目录；遍历过程中若又走回需要内核原语的路径
+ * （沙盒策略重放、另一层属主修复），同一线程会再次申请同一把锁。非递归锁
+ * 在这里就是自锁死：主线程永久阻塞，被看门狗杀掉，表现就是「闪退」。
+ * NSRecursiveLock 在同一线程重入时直接通过，互斥语义不变。
+ */
+static inline NSRecursiveLock *AppDumpKernelLock(void) {
+    static NSRecursiveLock *lock;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+    dispatch_once(&once, ^{ lock = [[NSRecursiveLock alloc] init]; });
     return lock;
 }
 

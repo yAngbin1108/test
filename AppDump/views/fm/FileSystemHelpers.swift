@@ -60,6 +60,7 @@ enum santanderfs {
     static func removeItemClearingImmutable(atPath path: String) throws {
         clearImmutableIfPossible(atPath: path)
         try FileManager.default.removeItem(atPath: path)
+        SandboxKeeper.afterDiskWrite("删除")
     }
 
     static func listdir(item: santanderitem, readsbx: Bool) -> santanderlisting {
@@ -323,6 +324,7 @@ enum santanderfs {
         do {
             clearImmutableIfPossible(atPath: path)
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            SandboxKeeper.afterDiskWrite("保存文件")
             return true
         } catch {
             return false

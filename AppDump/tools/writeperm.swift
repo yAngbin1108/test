@@ -40,6 +40,7 @@
 
 import Combine
 import Foundation
+import UIKit
 import Darwin
 
 // MARK: - 沙盒写权限探针与修复（blade: SKSandboxKeeper）
@@ -48,8 +49,15 @@ final class SandboxKeeper: ObservableObject {
     static let shared = SandboxKeeper()
 
     /// 特权路径。绝不能用自己的容器：那里始终可写，探针没有意义。
-    static let probeDir  = "/private/var/mobile/Library/Preferences"
-    static let probeFile = "/private/var/mobile/Library/Preferences/.sbxkit_alive"
+    ///
+    /// 两个探针：单一探针可能误判 —— 某些 entitlement / 容器规则会让
+    /// /var/mobile/Library/Preferences 在沙盒没逃逸时也能写，于是保活以为一切正常。
+    /// 两条路径都在 mobile 自己的可写区域里（属主 mobile），所以任何失败都只可能
+    /// 是 MAC（sandbox）拒绝，正是我们要检测的东西。任一路径失败即视为权限丢失。
+    static let probeDir   = "/private/var/mobile/Library/Preferences"
+    static let probeFile  = "/private/var/mobile/Library/Preferences/.sbxkit_alive"
+    static let probeDir2  = "/private/var/mobile/Library"
+    static let probeFile2 = "/private/var/mobile/Library/.sbxkit_alive2"
 
     // ——— 状态（只由 publishState 在主线程写） ———
     @Published private(set) var running = false
@@ -83,20 +91,38 @@ final class SandboxKeeper: ObservableObject {
     /// 而那正是要检测的失效形态。
     @discardableResult
     static func probe() -> Bool {
-        var e: Int32 = 0
-        let fd = open(probeFile, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        if !probeOne(probeFile) { return false }
+        if !probeOne(probeFile2) { return false }
+        setProbeErrno(0)
+        return true
+    }
+
+    /// 单条探针：create + write + unlink。
+    ///
+    /// ★ 必须先 unlink 再 open ★（照搬 FilzaJailedDS / Blade）
+    /// open(O_CREAT) 碰到已存在的文件时，需要的是**文件本身**的写权限，而不只是
+    /// 目录的；而这里只在成功时才 unlink。上一次跑到一半死掉、或文件被别的属主
+    /// 占住，之后每次探针都会失败，逃逸本身却是好的 —— 表现为「永远修不好」。
+    private static func probeOne(_ path: String) -> Bool {
+        unlink(path)
+
+        errno = 0
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         if fd < 0 {
-            e = errno
-            setProbeErrno(e)
+            setProbeErrno(errno)
             return false
         }
+        var e: Int32 = 0
         let marker = Array("alive\n".utf8)          // 6 字节
         let n = marker.withUnsafeBytes { write(fd, $0.baseAddress, marker.count) }
         if n != marker.count { e = errno } else { e = 0 }
         close(fd)
-        unlink(probeFile)
-        setProbeErrno(e)
-        return n == marker.count
+        unlink(path)
+        if n != marker.count {
+            setProbeErrno(e)
+            return false
+        }
+        return true
     }
 
     /// 当前是否真的有特权写权限（只读检查，不写内核）
@@ -272,10 +298,15 @@ final class SandboxKeeper: ObservableObject {
 
     func start() {
         guard !running else { return }
-        guard ds_is_ready() else {
-            emit("not starting: kernel primitive not up")
-            return
+
+        // ★ 不再因为「原语没就绪」就放弃启动 ★
+        // 旧代码这里是 guard ds_is_ready() else { return }，是致命的：如果启动时
+        // exploit 还没跑完（或者第一次逃逸失败），保活就永远不会被装上，之后
+        // 权限一掉就再也没人修。现在定时器无条件装上，tick 内部自己判。
+        if !ds_is_ready() {
+            emit("started anyway (kernel primitive not up yet — tick will retry)")
         }
+
         var iv = interval
         if iv < 3 { iv = 3 }
         if iv > 60 { iv = 60 }
@@ -287,15 +318,37 @@ final class SandboxKeeper: ObservableObject {
         timer = t
         running = true
         emit("started (every \(Int(iv))s)")
+
+        // ★ 回前台立刻补一次 ★
+        // 进程被挂起时 dispatch timer 不会走，用户切回来那段时间权限是掉的，
+        // 等下一个 7 秒 tick 才恢复，表现就是「权限掉了不会自己恢复」。
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                                        object: nil, queue: nil) { [weak self] _ in
+            self?.recoverNow()
+        })
+        observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                        object: nil, queue: nil) { [weak self] _ in
+            self?.recoverNow()
+        })
     }
 
     func stop() {
         guard running else { return }
         timer?.cancel()
         timer = nil
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        observers.removeAll()
         running = false
         emit("stopped")
     }
+
+    /// 立刻异步补一次检测/修补（回前台 / 首次启动 / 遇到权限错误时调）。
+    func recoverNow() {
+        queue.async { [weak self] in _ = self?.tick() }
+    }
+
+    private var observers: [NSObjectProtocol] = []
 
     /// 一条消息两个出口：日志和界面显示同一句话，否则事后对不上。
     private func emit(_ msg: String) {
@@ -305,6 +358,22 @@ final class SandboxKeeper: ObservableObject {
         } else {
             DispatchQueue.main.async { self.lastEvent = msg }
         }
+    }
+}
+
+// MARK: - 落盘之后
+
+extension SandboxKeeper {
+    /// 每次真实落盘（写/删/改名/复制）之后调。
+    ///
+    /// 逃逸改的是内存里的 sandbox 扩展表，内核每处理一次真实落盘就会按磁盘上的
+    /// profile 重推，把我们改的那份换回去 —— 也就是说「写一个文件权限必掉」是常态，
+    /// 不是偶发。只靠 7 秒轮询意味着每次写完都有几秒到几十秒的空窗，用户在这段
+    /// 时间里点什么都 EPERM。所以在每个落盘 API 之后立刻探一次、丢了就重放；
+    /// 探针通过时是零内核写（两个 create+write+unlink）。
+    static func afterDiskWrite(_ label: String) {
+        guard ds_is_ready() else { return }
+        _ = SandboxKeeper.shared.restoreIfLost(label)
     }
 }
 

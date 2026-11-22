@@ -424,7 +424,11 @@ final class AppDumpmgr: ObservableObject {
         if ftruncate(fd, off_t(total)) != 0 {
             return (false, "sbx truncate failed: errno=\(errno) \(String(cString: strerror(errno)))")
         }
-        
+
+        // 真实落盘会让内核按磁盘 profile 重推 sandbox 策略，这里立刻补一次，
+        // 否则接下来几秒内的任何操作都会 EPERM。
+        SandboxKeeper.afterDiskWrite("写入文件")
+
         return (true, "ok (\(total) bytes)")
     }
     
@@ -536,12 +540,6 @@ final class AppDumpmgr: ObservableObject {
         }
         defer { sbx_freestr(cstr) }
         return String(cString: cstr)
-    }
-    
-    func sbxelevate() {
-        DispatchQueue.main.async {
-            sbx_elevate();
-        }
     }
     
     func isapfs(_ path: String) -> Bool {

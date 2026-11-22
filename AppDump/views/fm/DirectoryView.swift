@@ -586,6 +586,7 @@ struct santanderdirview: View {
         do {
             santanderfs.clearImmutableIfPossible(atPath: entry.path)
             try FileManager.default.moveItem(atPath: entry.path, toPath: dest)
+            SandboxKeeper.afterDiskWrite("移动/改名")
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             msg = santandermsg(title: "重命名失败", text: error.localizedDescription)
@@ -616,6 +617,7 @@ struct santanderdirview: View {
 
         do {
             try FileManager.default.createDirectory(atPath: dest, withIntermediateDirectories: false, attributes: nil)
+            SandboxKeeper.afterDiskWrite("新建文件夹")
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             msg = santandermsg(title: "新建文件夹失败", text: error.localizedDescription)
@@ -646,6 +648,7 @@ struct santanderdirview: View {
 
         do {
             try Data(text.utf8).write(to: URL(fileURLWithPath: dest), options: .atomic)
+            SandboxKeeper.afterDiskWrite("新建文件")
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             msg = santandermsg(title: "新建文件失败", text: error.localizedDescription)
@@ -672,6 +675,7 @@ struct santanderdirview: View {
                 try santanderfs.removeItemClearingImmutable(atPath: dest)
             }
             try FileManager.default.copyItem(atPath: clipitem.path, toPath: dest)
+            SandboxKeeper.afterDiskWrite("粘贴")
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             msg = santandermsg(title: "粘贴失败", text: error.localizedDescription)
@@ -706,6 +710,7 @@ struct santanderdirview: View {
                 try santanderfs.removeItemClearingImmutable(atPath: entry.path)
             }
             try FileManager.default.copyItem(atPath: clipitem.path, toPath: entry.path)
+            SandboxKeeper.afterDiskWrite("替换")
             model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
             msg = santandermsg(title: "替换失败", text: error.localizedDescription)
