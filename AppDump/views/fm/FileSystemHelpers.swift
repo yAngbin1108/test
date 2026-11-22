@@ -63,6 +63,72 @@ enum santanderfs {
         SandboxKeeper.afterDiskWrite("删除")
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // MARK: 落盘被拒绝时的修复（Filza 的「属主不够就改属主」那一层）
+    // ─────────────────────────────────────────────────────────────
+
+    static func isPermissionDenial(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain {
+            return ns.code == Int(EACCES) || ns.code == Int(EPERM)
+        }
+        if ns.domain == NSCocoaErrorDomain {
+            return ns.code == NSFileWriteNoPermissionError ||
+                   ns.code == NSFileReadNoPermissionError
+        }
+        return false
+    }
+
+    /// 把错误翻成人话：权限不足时直接说「目录属主不是 mobile」，而不是让用户去猜
+    /// "You don't have permission to save the file … in folder …"。
+    static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        if isPermissionDenial(error) {
+            return "权限不足（\(ns.code)）：这个目录的属主不是 mobile。\n已尝试在内核里把父目录改成 501:501，仍未成功 —— 可以在「工具 → 修复写权限 → 容器属主」里对它整树改一次。"
+        }
+        return ns.localizedDescription
+    }
+
+    /// 被拒之后的修复。
+    ///   deep == false：只改**父目录**这一层（create/delete/rename 检查的是父目录），快；
+    ///   deep == true ：整棵容器树（会遍历 .app 里所有文件），慢但彻底。
+    @discardableResult
+    static func repairWriteDenial(for dest: String, deep: Bool) -> Bool {
+        let parent = (dest as NSString).deletingLastPathComponent
+        AppDumpmgr.shared.logmsg("[fm] 写入被拒，修属主后重试: \(dest)")
+
+        if deep {
+            if let root = WritePerm.ownershipRoot(for: dest) {
+                _ = WritePerm.chownTree(root)
+            } else if !parent.isEmpty, WritePerm.allowsModify(parent) {
+                _ = WritePerm.kernelTakeOwnership(parent)
+            }
+        } else if !parent.isEmpty, WritePerm.allowsModify(parent) {
+            _ = WritePerm.kernelTakeOwnership(parent)
+        }
+
+        // 沙盒策略可能同时被内核冲掉了（探针通过时零内核写）
+        _ = SandboxKeeper.shared.ensureWriteAccess()
+        return true
+    }
+
+    /// 跑一次会落盘的操作，被权限拒绝就修属主再重试（最多 3 轮）。
+    /// 返回 nil = 成功，否则是最后一次的错误。
+    static func performWithWriteRepair(_ dest: String, _ body: () throws -> Void) -> Error? {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                try body()
+                return nil
+            } catch {
+                lastError = error
+                guard isPermissionDenial(error), attempt < 2 else { return error }
+                _ = repairWriteDenial(for: dest, deep: (attempt == 1))
+            }
+        }
+        return lastError
+    }
+
     static func listdir(item: santanderitem, readsbx: Bool) -> santanderlisting {
         guard item.isdir else { return santanderlisting(items: [], empty: "不是目录。") }
 

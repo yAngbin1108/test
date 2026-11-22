@@ -583,13 +583,27 @@ struct santanderdirview: View {
             return
         }
 
-        do {
+        let err = santanderfs.performWithWriteRepair(dest) {
             santanderfs.clearImmutableIfPossible(atPath: entry.path)
             try FileManager.default.moveItem(atPath: entry.path, toPath: dest)
-            SandboxKeeper.afterDiskWrite("移动/改名")
-            model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
-        } catch {
-            msg = santandermsg(title: "重命名失败", text: error.localizedDescription)
+        }
+        if let err = err {
+            let desc = santanderfs.describe(err)
+            AppDumpmgr.shared.logmsg("[fm] 重命名失败 \(entry.path) -> \(dest): \(desc)")
+            showmsg(santandermsg(title: "重命名失败", text: desc), delayed: true)
+            return
+        }
+        SandboxKeeper.afterDiskWrite("移动/改名")
+        model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// 从 sheet 里发起的操作要等 sheet 收起来再弹 alert，否则 SwiftUI 会把
+    /// alert 丢掉 —— 表现就是「点了新建/重命名，什么都没发生」。
+    private func showmsg(_ m: santandermsg, delayed: Bool = false) {
+        if delayed {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { self.msg = m }
+        } else {
+            msg = m
         }
     }
 
@@ -615,13 +629,19 @@ struct santanderdirview: View {
             return
         }
 
-        do {
+        // 父目录属主是 root 时 createDirectory 一定 EACCES：先修属主再重试，
+        // 修不动就如实说「权限不足」，不再静默失败。
+        let err = santanderfs.performWithWriteRepair(dest) {
             try FileManager.default.createDirectory(atPath: dest, withIntermediateDirectories: false, attributes: nil)
-            SandboxKeeper.afterDiskWrite("新建文件夹")
-            model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
-        } catch {
-            msg = santandermsg(title: "新建文件夹失败", text: error.localizedDescription)
         }
+        if let err = err {
+            let text = santanderfs.describe(err)
+            AppDumpmgr.shared.logmsg("[fm] 新建文件夹失败 \(dest): \(text)")
+            showmsg(santandermsg(title: "新建文件夹失败", text: text), delayed: true)
+            return
+        }
+        SandboxKeeper.afterDiskWrite("新建文件夹")
+        model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func newfile(name: String, text: String) {
@@ -646,13 +666,17 @@ struct santanderdirview: View {
             return
         }
 
-        do {
+        let err = santanderfs.performWithWriteRepair(dest) {
             try Data(text.utf8).write(to: URL(fileURLWithPath: dest), options: .atomic)
-            SandboxKeeper.afterDiskWrite("新建文件")
-            model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
-        } catch {
-            msg = santandermsg(title: "新建文件失败", text: error.localizedDescription)
         }
+        if let err = err {
+            let desc = santanderfs.describe(err)
+            AppDumpmgr.shared.logmsg("[fm] 新建文件失败 \(dest): \(desc)")
+            showmsg(santandermsg(title: "新建文件失败", text: desc), delayed: true)
+            return
+        }
+        SandboxKeeper.afterDiskWrite("新建文件")
+        model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func paste(replace: Bool) {
@@ -670,16 +694,20 @@ struct santanderdirview: View {
         let base = (item.path as NSString).appendingPathComponent(clipitem.name)
         let dest = replace ? base : santanderfs.uniquepath(base: base)
 
-        do {
+        let err = santanderfs.performWithWriteRepair(dest) {
             if replace && FileManager.default.fileExists(atPath: dest) {
                 try santanderfs.removeItemClearingImmutable(atPath: dest)
             }
             try FileManager.default.copyItem(atPath: clipitem.path, toPath: dest)
-            SandboxKeeper.afterDiskWrite("粘贴")
-            model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
-        } catch {
-            msg = santandermsg(title: "粘贴失败", text: error.localizedDescription)
         }
+        if let err = err {
+            let desc = santanderfs.describe(err)
+            AppDumpmgr.shared.logmsg("[fm] 粘贴失败 \(dest): \(desc)")
+            showmsg(santandermsg(title: "粘贴失败", text: desc))
+            return
+        }
+        SandboxKeeper.afterDiskWrite("粘贴")
+        model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func replace(_ entry: santanderitem) {
@@ -705,16 +733,20 @@ struct santanderdirview: View {
             return
         }
 
-        do {
+        let err = santanderfs.performWithWriteRepair(entry.path) {
             if FileManager.default.fileExists(atPath: entry.path) {
                 try santanderfs.removeItemClearingImmutable(atPath: entry.path)
             }
             try FileManager.default.copyItem(atPath: clipitem.path, toPath: entry.path)
-            SandboxKeeper.afterDiskWrite("替换")
-            model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
-        } catch {
-            msg = santandermsg(title: "替换失败", text: error.localizedDescription)
         }
+        if let err = err {
+            let desc = santanderfs.describe(err)
+            AppDumpmgr.shared.logmsg("[fm] 替换失败 \(entry.path): \(desc)")
+            showmsg(santandermsg(title: "替换失败", text: desc))
+            return
+        }
+        SandboxKeeper.afterDiskWrite("替换")
+        model.load(query: query.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func delete(_ entry: santanderitem) {
