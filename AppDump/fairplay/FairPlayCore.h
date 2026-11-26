@@ -103,7 +103,8 @@ typedef struct {
     int slices_ok;           ///< 明文已写回并清了 cryptid 的切片数
     int slices_plain;        ///< cryptid != 0 但 cryptsize == 0：只清标志，没有明文要产出
     int slices_fake_plain;   ///< 声明加密但正文已是明文（假加密壳）：跳过解密、清 cryptid 直接出包
-    int residue_cipher;      ///< 假加密壳里那一小段声明区间仍是密文（无法解开），已按原样保留
+    int slices_residue_ok;   ///< 正文明文但声明区间是真密文（iOS 17 商店布局）：已按对齐窗口解开该小段
+    int residue_cipher;      ///< 声明区间那一小段仍是密文（对齐窗口也解不开），已按原样保留
     int heuristic_rejected;  ///< 内核成功、全部页回读成功、字节已变化，但判据判否
 } fp_file_stats_t;
 

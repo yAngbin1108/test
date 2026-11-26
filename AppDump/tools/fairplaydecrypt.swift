@@ -1128,6 +1128,7 @@ enum FPDecryptor {
         var heuristicRejected = 0
         var flagsCleared = 0
         var fakePlain = 0
+        var residueOk = 0
         var residueCipher = 0
         var firstFailure: String?
         let total = max(encryptedFiles.count, 1)
@@ -1173,6 +1174,7 @@ enum FPDecryptor {
             heuristicRejected += Int(stats.heuristic_rejected)
             flagsCleared += Int(stats.slices_plain)
             fakePlain += Int(stats.slices_fake_plain)
+            residueOk += Int(stats.slices_residue_ok)
             residueCipher += Int(stats.residue_cipher)
 
             switch status {
@@ -1231,12 +1233,14 @@ enum FPDecryptor {
             log("清了 \(flagsCleared) 个 cryptsize=0 切片的 cryptid 标志（没有明文要产出）")
         }
         if fakePlain > 0 {
-            log("假加密壳：\(fakePlain) 个切片「声明加密、正文其实是明文」，已清 cryptid 直接出包（没走解密）。"
-                + "这种包是重签/改壳工具留在设备上的副本，内核无论怎样都解不开，但它本来就没有密文要解。")
+            log("假加密壳：\(fakePlain) 个切片「声明加密、正文与声明区间都是明文」，已清 cryptid 直接出包（没走解密）。")
+        }
+        if residueOk > 0 {
+            log("新商店布局：\(residueOk) 个切片「正文明文、仅声明区间几 KB 真加密」，已按对齐窗口解开并清 cryptid。")
         }
         if residueCipher > 0 {
-            log("⚠️ 其中 \(residueCipher) 个切片声明的那 0x1000 字节仍是密文且未页对齐、无法解开，已按原样保留。"
-                + "装上后若该应用崩溃，说明那一段是真实代码，请改用 A · 内核砸壳。")
+            log("⚠️ 其中 \(residueCipher) 个切片声明的那 0x1000 字节是真密文但解不开（对齐窗口也失败），已按原样保留。"
+                + "这份包装上大概率闪退：请删除后从 App Store 重新下载原包再砸，或改用 A · 内核砸壳。")
         }
         if heuristicRejected > 0 {
             // 绝不能报成「FairPlay 拒绝」：内核已经把页解开了。

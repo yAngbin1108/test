@@ -321,9 +321,10 @@ int fp_parse(const char *path, fp_slice_t *slices, int max, int *count,
 
 #pragma mark - plaintext probe
 
-// 「假加密壳」检测：签名被剥掉、正文其实已经是明文的包，cryptid 还写着 1，
-// 加密区往往只剩一页（工具重签时缩小的占位）。这类包内核 mremap 必定失败
-// （未页对齐），但根本不需要解密——直接清标志按明文出包即可。
+// 「假加密壳」检测：cryptid 还写着 1、正文其实已经是明文的包。两种来源：
+//   A. 重签工具剥过壳：连声明区间也是明文 —— 直接清标志按明文出包。
+//   B. iOS 17 商店布局：正文以明文分发，声明区间那几 KB 是真密文 ——
+//      必须解（见 fp_decrypt_residue_range），跳过必崩。
 // 判据必须保守：真加密包的 __TEXT 整个在声明区间里，我们跳过它采样到的是
 // 头部/__LINKEDIT（也是低熵），所以**只有声明区间小到不像真加密区时**才走这条路。
 
@@ -657,6 +658,137 @@ int fp_attempt(const char *path, const fp_slice_t *s, int mode, bool addsigs,
     return fp_attempt_internal(path, s, mode, addsigs, out, -1, res);
 }
 
+#pragma mark - residue range decrypt
+
+// iOS 17 商店布局：正文绝大部分直接以明文分发，只有一小段（常见一页 4 KB）
+// 真的加密，且 cryptoff 只按 4 KB 对齐（如 0xA31000）。fp_attempt_internal
+// 要求 cryptoff 按系统页（16 KB）对齐，会直接拒绝；按「假加密壳」跳过又会把
+// 真密文留在包里——cryptid 已清、加载器不再解密，执行到那一页必崩。
+// 这里把映射窗口对齐到包含声明区间的整页，mremap 后逐页回读，
+// 只把声明区间 [cryptoff, cryptoff+cryptsize) 的字节写回，页内其余字节
+// 保持原样（内核若按整页解密，页内明文凭据会被解成垃圾，所以绝不能整页写回）。
+// 返回 0 = 声明区间已解开并写回 out_fd；-1 = 解不开（调用方走原警告路径）。
+static int fp_decrypt_residue_range(const char *map_path, const fp_slice_t *s,
+                                    int out_fd, fp_log_t log, void *ctx, int slice_index) {
+    const struct { int mode; bool addsigs; bool mask; } order[] = {
+        {FP_MODE_R_CID2, false, false},
+        {FP_MODE_R_CID2, true, false},
+        {FP_MODE_R_CID2, false, true},
+        {FP_MODE_RX_CID1, false, false},
+        {FP_MODE_RX_CID1, true, false},
+        {FP_MODE_RX_CID1, false, true},
+    };
+    int pg = getpagesize();
+    if (pg <= 0 || !s->has_enc || s->cryptsize == 0 || s->cryptsize > 0x4000) return -1;
+    const uint64_t page = (uint64_t)pg;
+    if (s->slice_off % page) return -1;
+
+    const uint64_t rstart = (uint64_t)s->cryptoff;
+    const uint64_t rend = rstart + (uint64_t)s->cryptsize;
+    const uint64_t astart = rstart & ~(page - 1);
+    const uint64_t aend = (rend + page - 1) & ~(page - 1);
+    if (aend <= astart || aend > UINT64_MAX - page) return -1;
+
+    // 声明区间的原始（密文）字节，用来对比与算熵。cryptsize <= 16 KB，很小。
+    uint8_t *orig = malloc(s->cryptsize);
+    if (!orig) return -1;
+    int probe_fd = open(map_path, O_RDONLY | O_NOFOLLOW);
+    if (probe_fd < 0) { free(orig); return -1; }
+    bool got = fp_pread_full(probe_fd, orig, s->cryptsize, (off_t)(s->slice_off + rstart));
+    close(probe_fd);
+    if (!got) { free(orig); return -1; }
+    uint64_t hist_b[256] = {0};
+    fp_accumulate_histogram(hist_b, orig, s->cryptsize);
+    double ent_before = fp_entropy_from_histogram(hist_b, s->cryptsize);
+    if (!(ent_before > 7.5)) { free(orig); return -1; } // 不是密文，不该走这里
+
+    const uint64_t map_len = aend; // 已从切片起点对齐
+    const size_t win_len = (size_t)(aend - astart);
+    uint8_t *win = malloc(win_len);
+    if (!win) { free(orig); return -1; }
+
+    int rc = -1;
+    for (size_t k = 0; k < sizeof order / sizeof order[0] && rc != 0; k++) {
+        fp_slice_t variant = *s;
+        if (order[k].mask) variant.cpusubtype &= ~0xFF000000u;
+
+        int fd = open(map_path, O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) break;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+            s->slice_off + map_len > (uint64_t)st.st_size) {
+            close(fd);
+            continue;
+        }
+        if (order[k].addsigs && s->cs_size &&
+            (uint64_t)s->cs_off <= s->slice_size &&
+            (uint64_t)s->cs_size <= s->slice_size - (uint64_t)s->cs_off) {
+            fsignatures_t fs = {
+                .fs_file_start = (off_t)s->slice_off,
+                .fs_blob_start = (void *)(uintptr_t)s->cs_off,
+                .fs_blob_size = s->cs_size,
+            };
+            fcntl(fd, F_ADDFILESIGS_RETURN, &fs);
+        }
+        int prot = PROT_READ | (order[k].mode == FP_MODE_RX_CID1 ? PROT_EXEC : 0);
+        uint8_t *base = mmap(NULL, (size_t)map_len, prot, MAP_PRIVATE, fd, (off_t)s->slice_off);
+        if (base == MAP_FAILED) { close(fd); continue; }
+
+        uint32_t cryptid = (order[k].mode == FP_MODE_R_CID2) ? 2 : 1;
+        errno = 0;
+        int mr = fp_mremap_encrypted(base + astart, win_len, cryptid,
+                                     variant.cputype, variant.cpusubtype);
+        int mr_errno = mr == 0 ? 0 : errno;
+        uint64_t pages_ok = 0, pages_total = win_len / page;
+        if (mr == 0) {
+            for (uint64_t po = 0; po < win_len; po += (uint64_t)page) {
+                vm_size_t gotp = 0;
+                kern_return_t kr = vm_read_overwrite(
+                    mach_task_self(), (vm_address_t)(base + astart + po),
+                    (vm_size_t)page, (vm_address_t)(win + po), &gotp);
+                if (kr == KERN_SUCCESS && gotp == (vm_size_t)page) pages_ok++;
+            }
+        }
+        munmap(base, (size_t)map_len);
+        close(fd);
+
+        if (mr != 0 || pages_ok != pages_total) {
+            fp_log(log, ctx, "  slice[%d] residue %s%s%s mremap=%d(%s) pages=%llu/%llu",
+                   slice_index, fp_mode_name(order[k].mode), order[k].addsigs ? "+sigs" : "",
+                   order[k].mask ? "+sub0" : "", mr,
+                   mr == 0 ? "ok" : strerror(mr_errno ? mr_errno : EINVAL),
+                   (unsigned long long)pages_ok, (unsigned long long)pages_total);
+            continue;
+        }
+        uint8_t *dst = win + (rstart - astart);
+        if (memcmp(orig, dst, s->cryptsize) == 0) {
+            fp_log(log, ctx, "  slice[%d] residue %s: 回读字节与密文相同，未解开",
+                   slice_index, fp_mode_name(order[k].mode));
+            continue;
+        }
+        uint64_t hist_a[256] = {0};
+        fp_accumulate_histogram(hist_a, dst, s->cryptsize);
+        double ent_after = fp_entropy_from_histogram(hist_a, s->cryptsize);
+        if (ent_after >= 7.5 || (ent_before - ent_after) < 0.5) {
+            fp_log(log, ctx, "  slice[%d] residue %s: 熵未降下来（%.2f->%.2f），不是明文",
+                   slice_index, fp_mode_name(order[k].mode), ent_before, ent_after);
+            continue;
+        }
+        if (!fp_pwrite_full(out_fd, dst, s->cryptsize, (off_t)(s->slice_off + rstart))) {
+            fp_log(log, ctx, "  slice[%d] residue 写回失败: %s", slice_index, strerror(errno));
+            break;
+        }
+        fp_log(log, ctx,
+               "  slice[%d] [OK] 残段解密：%s%s%s 声明区间 0x%x @0x%x 熵 %.2f->%.2f，已写回",
+               slice_index, fp_mode_name(order[k].mode), order[k].addsigs ? "+sigs" : "",
+               order[k].mask ? "+sub0" : "", s->cryptsize, s->cryptoff, ent_before, ent_after);
+        rc = 0;
+    }
+    free(win);
+    free(orig);
+    return rc;
+}
+
 #pragma mark - decrypt to file
 
 static int fp_copy_file(const char *src, const char *dst) {
@@ -787,16 +919,50 @@ int fp_decrypt_file_ex(const char *in_path, const char *map_path,
             continue;
         }
 
-        // ---- 假加密壳：签名被剥掉，正文根本就是明文，只有 cryptid 还写着 1 ----
-        // 常见于各种重签工具/改壳工具（换图标、换主题、装助手）落地到设备上的副本：
-        // 加密区被缩成一页，cryptoff 只按 4 KB 对齐 ⇒ 内核 mremap 必 EINVAL。
-        // 但内容本来就是明文，不需要解密：清掉 cryptid，按明文出包。
+        // ---- 正文明文、cryptid 还写着 1 的两种情形 ----
+        // A. 真·假壳（重签工具剥了壳）：声明区间也是明文，清标志即可。
+        // B. iOS 17 商店布局：正文以明文分发，只有声明区间那几 KB 是真密文
+        //    （cryptoff 只按 4 KB 对齐，正常 mremap 路径会拒）。这种**不能跳过**——
+        //    清了 cryptid 而不解这段，装上执行到那一页必崩。先试残段解密。
         // 判据保守到只对「声明区间 ≤ 1 个 16 KB 页」的切片生效，避免把真加密包
         // （头部/__LINKEDIT 采样也是低熵）误当成明文。
         if (s->cryptsize <= 0x4000) {
             fp_plain_probe_t body, region;
             if (fp_probe_plaintext(map_path, s, &body, &region) == 0 &&
                 fp_probe_is_plain(&body)) {
+                if (fp_probe_is_plain(&region)) {
+                    // A. 真·假壳：声明区间本身也是明文。
+                    uint32_t zero = 0;
+                    if (!fp_pwrite_full(out, &zero, 4, (off_t)cid_off)) {
+                        fp_log(log, ctx, "  slice[%d] flag clear failed: %s", i, strerror(errno));
+                        rc = -1;
+                        break;
+                    }
+                    if (stats) stats->slices_fake_plain++;
+                    fp_log(log, ctx,
+                           "  slice[%d] [OK] 假加密壳：正文熵 %.2f（明文 %d/%d 窗口，地标 %u），"
+                           "声明区间 0x%x @0x%x 熵 %.2f ⇒ 全是明文，清 cryptid 出包",
+                           i, body.entropy, body.plain_samples, body.samples, body.landmarks,
+                           s->cryptsize, s->cryptoff, region.entropy);
+                    continue;
+                }
+                // B. iOS 17 商店布局：声明区间是真密文，先按对齐窗口解这一小段。
+                if (fp_decrypt_residue_range(map_path, s, out, log, ctx, i) == 0) {
+                    uint32_t zero = 0;
+                    if (!fp_pwrite_full(out, &zero, 4, (off_t)cid_off)) {
+                        fp_log(log, ctx, "  slice[%d] flag clear failed: %s", i, strerror(errno));
+                        rc = -1;
+                        break;
+                    }
+                    if (stats) { stats->slices_ok++; stats->slices_residue_ok++; }
+                    fp_log(log, ctx,
+                           "  slice[%d] [OK] 新商店布局：正文明文、声明区间 0x%x @0x%x 已解开，"
+                           "清 cryptid 出包",
+                           i, s->cryptsize, s->cryptoff);
+                    continue;
+                }
+                // 残段也解不开（签名被替换、会话查不到等）：维持旧行为——
+                // 清标志、原样保留密文，但把后果说清楚：这份包装上大概率崩。
                 uint32_t zero = 0;
                 if (!fp_pwrite_full(out, &zero, 4, (off_t)cid_off)) {
                     fp_log(log, ctx, "  slice[%d] flag clear failed: %s", i, strerror(errno));
@@ -804,18 +970,12 @@ int fp_decrypt_file_ex(const char *in_path, const char *map_path,
                     break;
                 }
                 if (stats) stats->slices_fake_plain++;
+                if (stats) stats->residue_cipher++;
                 fp_log(log, ctx,
-                       "  slice[%d] [OK] 假加密壳：正文熵 %.2f（明文 %d/%d 窗口，地标 %u），"
-                       "声明区间 0x%x @0x%x 熵 %.2f ⇒ 已是明文，跳过解密、清 cryptid 出包",
-                       i, body.entropy, body.plain_samples, body.samples, body.landmarks,
-                       s->cryptsize, s->cryptoff, region.entropy);
-                if (!fp_probe_is_plain(&region)) {
-                    if (stats) stats->residue_cipher++;
-                    fp_log(log, ctx,
-                           "  slice[%d] ⚠️ 声明区间那 0x%x 字节仍是密文且解不开（未页对齐），"
-                           "已按原样保留；出包后若这个应用崩溃，说明那一段是真实代码，请改用 A · 内核砸壳",
-                           i, s->cryptsize);
-                }
+                       "  slice[%d] ⚠️ 声明区间那 0x%x 字节是真密文但解不开（对齐窗口也失败），"
+                       "已按原样保留并清了 cryptid ⇒ 这份包装上大概率闪退；"
+                       "请删除后从 App Store 重新下载原包再砸，或改用 A · 内核砸壳",
+                       i, s->cryptsize);
                 continue;
             }
         }
