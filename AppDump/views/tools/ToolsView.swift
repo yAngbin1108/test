@@ -4,7 +4,7 @@
 //
 //  第六个 tab：辅助工具（只保留已确认可用的功能）
 //
-//  已移除（iOS 17.5.1 + DarkSword 自签环境下不可用：这些功能依赖 tccd/securityd
+//  已移除（iOS 17.5.1 + 自签环境下不可用：这些功能依赖 tccd/securityd
 //  专属保护的 TCC.db / keychain-2.db，沙箱逃逸读不到，且没有可用的内核
 //  vnode_lookup 原语）：
 //    * 精细化权限管理

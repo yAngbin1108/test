@@ -2,7 +2,7 @@
 //  writeperm.swift
 //  AppDump
 //
-//  写权限（与 blade 最新版一模一样的机制）
+//  写权限
 //  ==========================================
 //
 //  第一层：沙盒策略探针 + 重放逃逸（SandboxKeeper）
@@ -12,7 +12,7 @@
 //  profile，写权限就悄悄没了。而内核读写原语本身是持久的（挂在进程的内核
 //  socket 结构上）。
 //
-//  所以 blade 的做法是：
+//  所以这里的做法是：
 //    * 用**特权路径**上的探针判断写权限是否还在
 //      （/private/var/mobile/Library/Preferences/.sbxkit_alive，create+write+unlink。
 //       不能放自己的容器里 —— 那里本来就可写，证明不了任何事）；
@@ -27,7 +27,7 @@
 //  UNIX 属主/权限检查，.app 包里的文件所有者通常不是本进程的 uid，于是即使
 //  已有完整读写沙盒扩展，open(O_WRONLY) 仍然 EACCES。
 //
-//  blade 的做法（与 FilzaJailedDS 一致）：沿 vnode -> v_data -> apfs_fsnode 在
+//  做法：沿 vnode -> v_data -> apfs_fsnode 在
 //  内核里把 uid/gid 改成 501:501，再把 owner 读写位补上（mode|0600）。
 //  apfs_fsnode 在普通可写 zone，内核写原语够得到。
 //
@@ -43,7 +43,7 @@ import Foundation
 import UIKit
 import Darwin
 
-// MARK: - 沙盒写权限探针与修复（blade: SKSandboxKeeper）
+// MARK: - 沙盒写权限探针与修复
 
 final class SandboxKeeper: ObservableObject {
     static let shared = SandboxKeeper()
@@ -67,10 +67,10 @@ final class SandboxKeeper: ObservableObject {
     @Published private(set) var lastProbeErrno: Int32 = 0
     @Published private(set) var lastProbeOK = false
     @Published private(set) var lastEvent: String?
-    /// 自动修复开关（blade: autoRepair）。关掉后后台 tick 只报告，不写内核。
+    /// 自动修复开关。关掉后后台 tick 只报告，不写内核。
     @Published var autoRepair = true
 
-    /// 探测间隔，blade 默认 7 秒，夹在 [3, 60]
+    /// 探测间隔，默认 7 秒，夹在 [3, 60]
     var interval: TimeInterval = 7.0
 
     private var timer: DispatchSourceTimer?
@@ -99,7 +99,7 @@ final class SandboxKeeper: ObservableObject {
 
     /// 单条探针：create + write + unlink。
     ///
-    /// ★ 必须先 unlink 再 open ★（照搬 FilzaJailedDS / Blade）
+    /// ★ 必须先 unlink 再 open ★
     /// open(O_CREAT) 碰到已存在的文件时，需要的是**文件本身**的写权限，而不只是
     /// 目录的；而这里只在成功时才 unlink。上一次跑到一半死掉、或文件被别的属主
     /// 占住，之后每次探针都会失败，逃逸本身却是好的 —— 表现为「永远修不好」。
@@ -128,7 +128,7 @@ final class SandboxKeeper: ObservableObject {
     /// 当前是否真的有特权写权限（只读检查，不写内核）
     static func hasPrivilegedWriteAccess() -> Bool { probe() }
 
-    /// 上次探针失败的 errno（blade: writeAccessProbeErrno）
+    /// 上次探针失败的 errno
     static var writeAccessProbeErrno: Int32 {
         probeLock.lock(); defer { probeLock.unlock() }
         return probeErrnoValue
@@ -204,7 +204,7 @@ final class SandboxKeeper: ObservableObject {
         return ok
     }
 
-    /// 手动「修复写权限」（blade: repair 菜单 / -[MainViewController repairWriteAccess]）。
+    /// 手动「修复写权限」。
     /// 与后台 tick 的区别：不受 autoRepair 与失败上限限制，并把原因写清楚。
     @discardableResult
     func repairNow() -> Bool {
@@ -242,7 +242,7 @@ final class SandboxKeeper: ObservableObject {
         return after
     }
 
-    /// 文件操作后发现写权限被内核冲掉时调用（blade: restoreIfLost:）。
+    /// 文件操作后发现写权限被内核冲掉时调用。
     /// 返回 true 表示可以重试该操作。
     @discardableResult
     func restoreIfLost(_ label: String) -> Bool {
@@ -255,7 +255,7 @@ final class SandboxKeeper: ObservableObject {
         return ok
     }
 
-    /// 只做一次内核写：重放沙盒策略（blade: sbx_escape(proc)）。
+    /// 只做一次内核写：重放沙盒策略（sbx_escape(proc)）。
     /// sbx_escape() 每次都从内核重新读 proc → proc_ro → ucred → cr_label →
     /// sandbox → ext_set，内核重建过的结构也能接住，不会用到缓存。
     /// 它读写内核内存，必须和其它原语用户（砸壳、扫描、属主遍历）互斥。
@@ -377,7 +377,7 @@ extension SandboxKeeper {
     }
 }
 
-// MARK: - 容器属主（blade: SKKernelTakeOwnership / apfs own_tree）
+// MARK: - 容器属主（apfs own_tree）
 
 enum WritePerm {
     static let targetUID: uid_t = 501
@@ -480,7 +480,7 @@ enum WritePerm {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // MARK: 递归改属主（blade: apfs own_tree）
+    // MARK: 递归改属主（apfs own_tree）
     // ─────────────────────────────────────────────────────────────
 
     struct WalkResult {
@@ -507,7 +507,7 @@ enum WritePerm {
     private static func walk(_ path: String, depth: Int, uid: uid_t, gid: gid_t, r: inout WalkResult) {
         if depth > maxDepth || r.entries + r.failed > maxEntries { return }
 
-        // lstat：不跟随软链接，行为与 blade 的 C 走查一致
+        // lstat：不跟随软链接，与内核态走查行为一致
         var st = stat()
         guard lstat(path, &st) == 0 else { r.skipped += 1; return }
 
@@ -540,7 +540,7 @@ enum WritePerm {
     // ─────────────────────────────────────────────────────────────
 
     /// 写之前保证有权限：容器里先把属主改成 mobile（父目录不是我们的才做），
-    /// 再确认沙盒策略还在（不在就重放）。blade: SKEnsureWriteAccess。
+    /// 再确认沙盒策略还在（不在就重放）。
     @discardableResult
     static func ensureWriteAccess(_ path: String) -> Bool {
         if let root = ownershipRoot(for: path), ds_is_ready() {
@@ -558,7 +558,7 @@ enum WritePerm {
         return SandboxKeeper.shared.ensureWriteAccess()
     }
 
-    /// 后台整树修一次（每个根每次启动只跑一次）。blade: SKOwnershipFixAsync
+    /// 后台整树修一次（每个根每次启动只跑一次）。
     static func fixAsync(_ path: String) {
         guard let root = ownershipRoot(for: path), ds_is_ready() else { return }
 
@@ -574,7 +574,7 @@ enum WritePerm {
         }
     }
 
-    /// 应用包/数据容器一次性取得写权限（blade: SKEnsureAppChowned，去重 + 串行队列）
+    /// 应用包/数据容器一次性取得写权限（去重 + 串行队列）
     static func ensureAppChowned(_ appPath: String) {
         guard let root = ownershipRoot(for: appPath) else { return }
         chownQueue.async {

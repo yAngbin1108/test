@@ -2,7 +2,7 @@
 //  downgrademgr.swift
 //  AppDump
 //
-//  App Store 历史版本降级（复刻 Cyanide 的 App Downgrade 实现）。
+//  App Store 历史版本降级（App Downgrade 实现）。
 //
 //  链路：
 //   1. itunes.apple.com/lookup?bundleId=...&limit=1&media=software&country=XX
@@ -250,7 +250,7 @@ final class storekitbridge {
     /// SKUIClientContext / SKUIItem / SKUIItemOffer 都定义在这个框架里，
     /// 不 dlopen 的话 NSClassFromString 永远返回 nil（表现为提示
     /// "StoreKit 私有接口不可用 (SKUIClientContext)"）。
-    /// Cyanide 也是先 dlopen 再取类。
+    /// 先 dlopen 再取类。
     private static var storekituiLoaded = false
 
     @discardableResult

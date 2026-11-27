@@ -1115,7 +1115,7 @@ struct DecryptView: View {
             }
 
             // ── 解密 bundle 内其余全部加密 Mach-O ──────────────────────────
-            // blade 的做法：递归扫整个 bundle，覆盖 Frameworks/*.framework、
+            // 递归扫整个 bundle，覆盖 Frameworks/*.framework、
             // PlugIns/*.appex 以及散落的 .dylib，而不只是 Frameworks 一层。
             // 扩展（.appex）跑在自己的进程里，宿主 pid 匹配不上它的 LC_UUID，
             // 所以用 decrypt_binary_search：先试宿主 pid，失败再遍历所有进程。

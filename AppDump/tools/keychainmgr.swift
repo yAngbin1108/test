@@ -10,7 +10,7 @@
 //
 //  注意：只清理本 App 自己 keychain-access-group 里的条目（删掉后系统重新生成）。
 //  系统级 keychain（/private/var/Keychains/keychain-2.db）受 securityd 专属保护，
-//  在 iOS 17.5.1 + DarkSword 自签环境下读不到，原「备份 / 扫描系统 Keychain」
+//  在 iOS 17.5.1 + 自签环境下读不到，原「备份 / 扫描系统 Keychain」
 //  功能已移除。
 //
 

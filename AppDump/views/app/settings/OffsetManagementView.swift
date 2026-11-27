@@ -3,8 +3,6 @@
 //  AppDump
 //
 //  Created by lunginspector on 5/9/26.
-//  yo this shit is BROKEN (roooot, 09.05.2026)
-//  fixed it (roooot, 09.05.2026)
 //
 
 import SwiftUI

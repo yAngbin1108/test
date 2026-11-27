@@ -64,7 +64,7 @@ enum santanderfs {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // MARK: 落盘被拒绝时的修复（Filza 的「属主不够就改属主」那一层）
+    // MARK: 落盘被拒绝时的修复（属主不够就改属主）
     // ─────────────────────────────────────────────────────────────
 
     static func isPermissionDenial(_ error: Error) -> Bool {
@@ -210,7 +210,7 @@ enum santanderfs {
                     }
                 }
 
-                // 目录「N 项 · 时间」，文件「大小 · 时间」，与 Blade 的行样式一致
+                // 目录「N 项 · 时间」，文件「大小 · 时间」
                 let attrs = try? fm.attributesOfItem(atPath: full)
                 let datestr = (attrs?[.modificationDate] as? Date).map { santanderitem.datestring($0) }
                 var meta: String? = datestr

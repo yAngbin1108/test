@@ -18,7 +18,7 @@ import Foundation
 
 enum blockupdates {
 
-    /// placeholder 目录名（与 Cyanide 源码一致）
+    /// placeholder 目录名
     static let placeholderName = "com.apple.mobileinstallation.placeholder"
 
     private static func log(_ m: String) { AppDumpmgr.shared.logmsg("(block) \(m)") }

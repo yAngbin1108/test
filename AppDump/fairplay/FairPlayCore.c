@@ -435,7 +435,7 @@ static bool fp_attempt_hard_ok(const fp_attempt_t *a) {
 
 bool fp_attempt_looks_decrypted(const fp_attempt_t *a) {
     // 只按「熵掉下来了没有」判，不再数 ARM64 地标词（ret/pacibsp）。
-    // 实测（iPadn 2026-11-19 真机样本）：真正解开 17 个文件，峰值熵 7.06；
+    // 实测（真机样本）：真正解开 17 个文件，峰值熵 7.06；
     // 旧地标规则判错的 14 个其实是数据型/重度混淆载荷，熵只有 0.53–6.19、
     // code 0→0。数地标会把它们当失败，白试其余模式，还出 -PARTIAL。
     // 未解开的密文始终停在 ~8.0，半解开的页 > 7.8。
