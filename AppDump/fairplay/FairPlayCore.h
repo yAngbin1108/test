@@ -1,9 +1,8 @@
 // FairPlayCore — on-device FairPlay (App Store DRM) decryption primitives.
 //
-// 来源：iPadn (github.com/mengangs/ipadn) 的 iPadn-iOS/FairPlayCore，GPL-2.0-or-later。
-// 与本仓库（AGPL）兼容；修改处已在文件内注明。
+// GPL-2.0-or-later；与本仓库（AGPL）兼容；修改处已在文件内注明。
 //
-// Mechanism (independent implementation; described by morzelowski/FairPlayed):
+// Mechanism (independent implementation):
 //   * mremap_encrypted() has no privilege check, so any process can ask the
 //     kernel to run a mapped range through FairPlay (text_crypter_create ->
 //     FairPlayIOKit -> fairplayd).

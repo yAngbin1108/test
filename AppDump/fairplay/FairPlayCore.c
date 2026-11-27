@@ -1,6 +1,6 @@
-// FairPlayCore.c — 来源 iPadn (github.com/mengangs/ipadn) 的 iPadn-iOS/FairPlayCore，GPL-2.0-or-later。
+// FairPlayCore.c — GPL-2.0-or-later。
 //
-// 本仓库用法与上游不同：
+// 本仓库的用法：
 //   * 不作为独立模块（framework）编译，直接编进 AppDump 主 target；
 //   * Swift 侧只在 fairplaydecrypt.swift 里通过 fp_decrypt_file/fp_parse 调用；
 //   * 上游的 fp_attempt（内存回读）保留但未使用，仍可单独调试。
