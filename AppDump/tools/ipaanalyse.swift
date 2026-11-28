@@ -101,7 +101,7 @@ final class ipazipreader {
         guard let h = FileHandle(forReadingAtPath: path) else { return nil }
         handle = h
         let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
-        fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? h.seekEnd()
+        fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? h.seekToEnd()
         guard fileSize >= 22, readCentralDirectory() else {
             try? handle.close()
             return nil
@@ -233,14 +233,16 @@ final class ipazipreader {
     }
 
     /// 解出条目（最多 maxBytes 解压后）。只用于看头部 / plist，不做全文件解压。
-    func inflate(_ name: String, maxBytes: Int) -> Data? {
+    /// 注意名字不能叫 inflate：会和 zlib 的全局函数 inflate() 撞名，
+    /// 同一类型里的 static func 调它就解析成实例方法了。
+    func entryData(_ name: String, maxBytes: Int) -> Data? {
         guard let (raw, method) = read(name, maxBytes: maxBytes) else { return nil }
         if method == 0 { return raw }
         guard method == 8 else { return nil }
-        return Self.inflateRaw(raw, limit: maxBytes)
+        return Self.decompressRaw(raw, limit: maxBytes)
     }
 
-    static func inflateRaw(_ raw: Data, limit: Int) -> Data? {
+    static func decompressRaw(_ raw: Data, limit: Int) -> Data? {
         guard !raw.isEmpty, limit > 0 else { return nil }
         var strm = z_stream()
         // zlibVersion() 即 C 里的 zlibVersion 常量字符串
@@ -374,7 +376,7 @@ enum ipaanalyzer {
 
     /// 读一个包内 plist（STORE 直接解，DEFLATE 就地 inflate）。
     static func plist(_ zip: ipazipreader, _ name: String) -> [String: Any]? {
-        guard let data = zip.inflate(name, maxBytes: 4 << 20), data.count >= 8 else { return nil }
+        guard let data = zip.entryData(name, maxBytes: 4 << 20), data.count >= 8 else { return nil }
         return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any]
     }
 
@@ -477,7 +479,7 @@ enum ipaanalyzer {
         var archSet: [String] = []
         for key in exeKeys {
             // 512KB 够覆盖 mach header + 全部 load commands（AppDump 实测 ~5KB）
-            let head = zip.inflate(key, maxBytes: 512 << 10)
+            let head = zip.entryData(key, maxBytes: 512 << 10)
             var archs: [String] = []
             var encrypted = false
             var hasCrypt = false
