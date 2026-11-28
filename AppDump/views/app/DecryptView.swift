@@ -1599,9 +1599,9 @@ struct IPARow: View {
     @State private var offset: CGFloat = 0
     @State private var opened = false
 
-    /// 每个动作按钮宽度，右滑依次露出 删除 / 分析 / 分享。
-    private let actionWidth: CGFloat = 76
-    private var totalWidth: CGFloat { actionWidth * 3 }
+    /// 右滑只露出「删除」一个动作；分析点整行即可，分享在行右侧有按钮。
+    private let actionWidth: CGFloat = 88
+    private var totalWidth: CGFloat { actionWidth }
 
     /// 行高固定：动作层用 maxHeight: .infinity 才能和内容等高，
     /// 否则它会塌成按钮文字的高度，圆角处就会漏出红 / 绿底色。
@@ -1766,20 +1766,12 @@ struct IPARow: View {
             }
     }
 
-    /// 右滑露出的三个动作（从左到右：删除 / 分析 / 分享）
+    /// 右滑露出的动作：只有删除
     private var actions: some View {
         HStack(spacing: 0) {
             actionButton("删除", "trash.fill", .red) {
                 close()
                 onDelete()
-            }
-            actionButton("分析", "sparkle.magnifyingglass", .blue) {
-                close()
-                onAnalyze()
-            }
-            actionButton("分享", "square.and.arrow.up.fill", .green) {
-                close()
-                onShare()
             }
             Spacer(minLength: 0)
         }
