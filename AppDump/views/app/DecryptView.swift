@@ -505,8 +505,7 @@ struct DecryptView: View {
                         }
                     },
                     onShare: { shareIPA(ipa) },
-                    onAnalyze: { openAnalysis(for: ipa) },
-                    onDelete: { ipaPendingDelete = ipa }
+                    onAnalyze: { openAnalysis(for: ipa) }
                 )
             }
         }
@@ -1593,35 +1592,22 @@ struct IPARow: View {
     let onToggle: () -> Void
     let onShare: () -> Void
     let onAnalyze: () -> Void
-    let onDelete: () -> Void
 
-    /// 露出的位移量：正数 = 内容右移、左侧露出动作（右滑）。
-    @State private var offset: CGFloat = 0
-    @State private var opened = false
-
-    /// 右滑只露出「删除」一个动作；分析点整行即可，分享在行右侧有按钮。
-    private let actionWidth: CGFloat = 88
-    private var totalWidth: CGFloat { actionWidth }
-
-    /// 行高固定：动作层用 maxHeight: .infinity 才能和内容等高，
-    /// 否则它会塌成按钮文字的高度，圆角处就会漏出红 / 绿底色。
     private let rowHeight: CGFloat = 68
     private let corner: CGFloat = 12
 
     var body: some View {
-        ZStack {
-            actions
-            content
-                .frame(height: rowHeight)
-                .background(AppTheme.cardFill)
-                .overlay(alignment: .leading) { selectionBorder }
-                .offset(x: offset)
-                .gesture(pager)
-        }
-        .frame(height: rowHeight)
-        .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
-        .animation(.interactiveSpring(response: 0.26, dampingFraction: 0.88), value: offset)
-        .transaction { t in if editing { t.animation = nil } }
+        content
+            .frame(height: rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppTheme.cardFill)
+            .overlay(alignment: .leading) { selectionBorder }
+            .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
+            .contentShape(Rectangle())
+            .onTapGesture {
+                // 点整行：编辑时勾选，否则打开分析
+                if editing { onToggle() } else { onAnalyze() }
+            }
     }
 
     // MARK: - 内容
@@ -1680,13 +1666,6 @@ struct IPARow: View {
             }
         }
         .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if editing { onToggle() }
-            else if opened { close() }
-            else { onAnalyze() }
-        }
     }
 
     @ViewBuilder
@@ -1733,67 +1712,6 @@ struct IPARow: View {
         return a.installable ? ("可安装", .green) : nil
     }
 
-    // MARK: - 滑动（只有右滑一个方向）
-
-    private func close() {
-        offset = 0
-        opened = false
-    }
-
-    private var pager: some Gesture {
-        DragGesture(minimumDistance: 12)
-            .onChanged { v in
-                guard !editing else { return }
-                var x = v.translation.width
-                if opened {
-                    x += totalWidth
-                }
-                // 只允许 0…totalWidth，负方向直接压回 0（不做左滑）
-                offset = min(max(x, 0), totalWidth)
-            }
-            .onEnded { v in
-                guard !editing else { return }
-                let predicted = v.predictedEndTranslation.width + (opened ? totalWidth : 0)
-                let open: Bool
-                if opened {
-                    // 已经打开：往回拉超过一段才收起
-                    open = !(predicted < totalWidth / 3)
-                } else {
-                    open = predicted > totalWidth / 3
-                }
-                offset = open ? totalWidth : 0
-                opened = open
-            }
-    }
-
-    /// 右滑露出的动作：只有删除
-    private var actions: some View {
-        HStack(spacing: 0) {
-            actionButton("删除", "trash.fill", .red) {
-                close()
-                onDelete()
-            }
-            Spacer(minLength: 0)
-        }
-        // 必须显式等高：ZStack 里的 maxHeight: .infinity 拿到的提议是无界的，
-        // 只会塌成按钮自身内容高度，行上下就会露出动作按钮的底色。
-        .frame(height: rowHeight)
-    }
-
-    private func actionButton(_ title: String, _ icon: String, _ color: Color,
-                              _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 3) {
-                Image(systemName: icon).font(.body.weight(.semibold))
-                Text(title).font(.caption2.weight(.medium))
-            }
-            .frame(width: actionWidth)
-            .frame(maxHeight: .infinity)
-            .foregroundStyle(.white)
-            .background(color)
-        }
-        .buttonStyle(.plain)
-    }
 }
 
 // MARK: - IPA 分析详情
