@@ -101,7 +101,7 @@ final class ipazipreader {
         guard let h = FileHandle(forReadingAtPath: path) else { return nil }
         handle = h
         let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
-        fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? h.seekToEnd()
+        fileSize = (attrs[.size] as? NSNumber)?.uint64Value ?? (try? h.seekToEnd()) ?? 0
         guard fileSize >= 22, readCentralDirectory() else {
             try? handle.close()
             return nil
