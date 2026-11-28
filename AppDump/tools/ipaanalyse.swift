@@ -374,6 +374,12 @@ enum ipaanalyzer {
         let count: Int
     }
 
+    /// 是不是某个 bundle（.app / .appex）的 Info.plist
+    static func isBundleInfoPlist(_ name: String) -> Bool {
+        let low = name.lowercased()
+        return low.hasSuffix(".app/info.plist") || low.hasSuffix(".appex/info.plist")
+    }
+
     /// 读一个包内 plist（STORE 直接解，DEFLATE 就地 inflate）。
     static func plist(_ zip: ipazipreader, _ name: String) -> [String: Any]? {
         guard let data = zip.entryData(name, maxBytes: 4 << 20), data.count >= 8 else { return nil }
@@ -398,15 +404,17 @@ enum ipaanalyzer {
         // ── 1. 定位 Payload 下的 .app ──
         var mainPrefix: String?
         var extPrefixes: [String] = []
-        for name in names where name.lowercased().hasSuffix(".app/info.plist") {
+        for name in names where Self.isBundleInfoPlist(name) {
             let parts = name.split(separator: "/").map(String.init)
             guard let payload = parts.firstIndex(where: { $0.lowercased() == "payload" }),
                   payload + 2 < parts.count else { continue }
-            // 最后一个「后面还跟着一级」的 *.app 就是当前 Info.plist 所属的 bundle
+            // 最后一个「后面还跟着一级」的 *.app / *.appex 就是当前 Info.plist 所属的 bundle。
+            // 注意 .appex 并不以 .app 结尾，两个都要认，否则扩展整段被跳过。
             var appIdx = payload
             var scan = payload + 1
             while scan + 1 < parts.count {
-                if parts[scan].lowercased().hasSuffix(".app") { appIdx = scan }
+                let low = parts[scan].lowercased()
+                if low.hasSuffix(".app") || low.hasSuffix(".appex") { appIdx = scan }
                 scan += 1
             }
             guard appIdx > payload else { continue }
