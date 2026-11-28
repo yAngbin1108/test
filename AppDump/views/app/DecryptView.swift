@@ -43,6 +43,8 @@ struct OutputIPA: Identifiable {
     let size: Int64
     let date: Date
     let source: IPASource
+    /// 深分析结果（后台补上，没有时列表只显示文件名 / 大小 / 时间）
+    var analysis: ipaanalysis? = nil
 }
 
 /// 顶部模式：应用列表 / 导出 IPA
@@ -74,6 +76,16 @@ struct DecryptView: View {
     // IPA 管理
     @State private var mode: DecryptMode = .apps
     @State private var ipas: [OutputIPA] = []
+    /// 已分析过的包：路径 -> 结果。扫描刷新列表时沿用，避免每次重进都重算。
+    @State private var ipaAnalysis: [String: ipaanalysis] = [:]
+    /// 正在分析中的包路径，列表显示「分析中…」
+    @State private var ipaAnalyzing: Set<String> = []
+    /// 正在查看分析的包
+    @State private var ipaDetail: OutputIPA? = nil
+    /// 滑动删除 / 清空 的二次确认
+    @State private var ipaPendingDelete: OutputIPA? = nil
+    /// IPA 模式筛选：tried 过「全部 / 可安装 / 未解密 / 结构异常」
+    @AppStorage("decrypt.ipafilter") private var ipaFilterRaw: Int = 0
     @State private var loadingipas: Bool = false
     @State private var ipaEditing: Bool = false
     @State private var selectedipas: Set<UUID> = []
@@ -91,11 +103,30 @@ struct DecryptView: View {
         return apps.filter { $0.name.lowercased().contains(q) || $0.bundleID.lowercased().contains(q) }
     }
 
+    /// IPA 列表筛选：搜索词 + 状态筛选（全部 / 可直接安装 / 未解密 / 结构异常）
     private var filteredipas: [OutputIPA] {
+        var list = ipas
+        switch ipaFilterRaw {
+        case 1: list = list.filter { $0.analysis?.installable == true }
+        case 2: list = list.filter { $0.analysis?.encrypted == true }
+        case 3: list = list.filter { a in
+            guard let a = a.analysis else { return false }
+            return !a.integrity.isOK
+        }
+        default: break
+        }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return ipas }
+        if trimmed.isEmpty { return list }
         let q = trimmed.lowercased()
-        return ipas.filter { $0.baseName.lowercased().contains(q) || $0.fileName.lowercased().contains(q) }
+        return list.filter { ipa in
+            if ipa.baseName.lowercased().contains(q) { return true }
+            if ipa.fileName.lowercased().contains(q) { return true }
+            if let a = ipa.analysis {
+                if (a.appName ?? "").lowercased().contains(q) { return true }
+                if (a.bundleID ?? "").lowercased().contains(q) { return true }
+            }
+            return false
+        }
     }
 
     /// 已生成过 IPA 的应用名集合（用于提示“避免重复砸壳/提取”）
@@ -236,6 +267,36 @@ struct DecryptView: View {
             // 任何路径（A 内核 / B FairPlay / 提取）写出新 IPA 都即时刷新
             loadIPAs()
         }
+        .onChange(of: ipaEditing) { editing in
+            if editing { selectedipas.removeAll() }
+        }
+        .sheet(item: $ipaDetail) { ipa in
+            NavigationStack {
+                ipaanalysisView(ipa: ipa,
+                                onShare: { shareIPA(ipa) },
+                                onDelete: {
+                                    ipaDetail = nil
+                                    ipaPendingDelete = ipa
+                                })
+            }
+        }
+        .confirmationDialog(
+            ipaPendingDelete.map { "删除 \($0.fileName)？" } ?? "",
+            isPresented: Binding(
+                get: { ipaPendingDelete != nil },
+                set: { if !$0 { ipaPendingDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let ipa = ipaPendingDelete {
+                Button("删除", role: .destructive) { deleteIPA(ipa) }
+            }
+            Button("取消", role: .cancel) { ipaPendingDelete = nil }
+        } message: {
+            if let ipa = ipaPendingDelete {
+                Text("\(ByteCountFormatter.string(fromByteCount: ipa.size, countStyle: .file)) · 删除后无法恢复。")
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             if let app = pendingdecrypt {
                 pendingdecrypt = nil
@@ -349,29 +410,80 @@ struct DecryptView: View {
     // MARK: - IPA 管理卡片（ScrollView 布局，间距写死，不依赖 section 间距）
 
     private var ipaSummaryCard: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("共 \(filteredipas.count) 个 IPA")
-                    .font(.subheadline.weight(.medium))
-                Text("占用 \(byteString(totalipaSize))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("共 \(filteredipas.count) 个 IPA")
+                        .font(.subheadline.weight(.medium))
+                    Text("占用 \(byteString(totalipaSize))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if ipaEditing {
+                    Button("全选") {
+                        selectedipas = Set(filteredipas.map { $0.id })
+                    }
+                    .font(.footnote)
+                    Button("清空全部", role: .destructive) {
+                        confirmClearAll()
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                }
             }
-            Spacer()
-            if ipaEditing {
-                Button("全选") {
-                    selectedipas = Set(filteredipas.map { $0.id })
+
+            // 状态统计：只在分析完成的包之间统计
+            let done = ipas.compactMap { $0.analysis }
+            if !done.isEmpty {
+                HStack(spacing: 14) {
+                    ipaStat("可安装", done.filter { $0.installable }.count, .green)
+                    ipaStat("未解密", done.filter { $0.encrypted }.count, .red)
+                    ipaStat("异常", done.filter { !$0.integrity.isOK }.count, .orange)
+                    Spacer()
                 }
-                .font(.footnote)
-                Button("清空全部", role: .destructive) {
-                    confirmClearAll()
+            }
+
+            HStack(spacing: 6) {
+                Menu {
+                    Button { ipaFilterRaw = 0 } label: { filterLabel("全部", 0) }
+                    Button { ipaFilterRaw = 1 } label: { filterLabel("可直接安装", 1) }
+                    Button { ipaFilterRaw = 2 } label: { filterLabel("未解密", 2) }
+                    Button { ipaFilterRaw = 3 } label: { filterLabel("结构异常", 3) }
+                } label: {
+                    Label(ipaFilterRaw == 0 ? "全部" : ["全部", "可直接安装", "未解密", "结构异常"][min(ipaFilterRaw, 3)],
+                          systemImage: "line.3.horizontal.decrease.circle")
+                        .font(.footnote)
                 }
-                .font(.footnote)
-                .foregroundStyle(.red)
+                Spacer()
+                Button {
+                    analyzeAllIPAs(force: true)
+                } label: {
+                    Label("重新分析", systemImage: "sparkle.magnifyingglass")
+                        .font(.footnote)
+                }
             }
         }
         .padding(14)
         .glassCard()
+    }
+
+    private func ipaStat(_ title: String, _ n: Int, _ color: Color) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text("\(title) \(n)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func filterLabel(_ title: String, _ value: Int) -> some View {
+        if ipaFilterRaw == value {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
+        }
     }
 
     private var ipaRowsCard: some View {
@@ -382,6 +494,8 @@ struct DecryptView: View {
                 }
                 IPARow(
                     ipa: ipa,
+                    analysis: ipaAnalysis[ipa.path],
+                    analyzing: ipaAnalyzing.contains(ipa.path),
                     editing: ipaEditing,
                     selected: selectedipas.contains(ipa.id),
                     onToggle: {
@@ -391,7 +505,9 @@ struct DecryptView: View {
                             selectedipas.insert(ipa.id)
                         }
                     },
-                    onShare: { shareIPA(ipa) }
+                    onShare: { shareIPA(ipa) },
+                    onAnalyze: { openAnalysis(for: ipa) },
+                    onDelete: { ipaPendingDelete = ipa }
                 )
                 .padding(.vertical, 6)
             }
@@ -582,10 +698,91 @@ struct DecryptView: View {
             }
             results.sort { $0.date > $1.date }
             DispatchQueue.main.async {
+                // 沿用已经分析过的结果（文件没变就不重算）
+                for i in results.indices {
+                    if let cached = ipaAnalysis[results[i].path] { results[i].analysis = cached }
+                }
+                // 文件被外部删掉 / 改名时清掉对应缓存
+                let live = Set(results.map { $0.path })
+                ipaAnalysis = ipaAnalysis.filter { live.contains($0.key) }
                 ipas = results
                 loadingipas = false
+                analyzeAllIPAs(force: false)
             }
         }
+    }
+
+    // MARK: - IPA 分析
+
+    /// 逐个在后台分析（串行，避免同时开多个 zip 句柄和 512KB 缓冲）。
+    /// force = false 时跳过已经有结果的包。
+    private func analyzeAllIPAs(force: Bool) {
+        let pending = ipas.filter { !ipaAnalyzing.contains($0.path) && (force || ipaAnalysis[$0.path] == nil) }
+        guard !pending.isEmpty else { return }
+        ipaAnalyzing.formUnion(pending.map { $0.path })
+        DispatchQueue.global(qos: .utility).async {
+            for ipa in pending {
+                let result = ipaanalyzer.analyze(path: ipa.path)
+                DispatchQueue.main.async {
+                    ipaAnalysis[ipa.path] = result
+                    ipaAnalyzing.remove(ipa.path)
+                    if let idx = ipas.firstIndex(where: { $0.path == ipa.path }) {
+                        ipas[idx].analysis = result
+                    }
+                }
+            }
+        }
+    }
+
+    /// 点「分析」：有缓存直接展示，没有就先算再展示。
+    private func openAnalysis(for ipa: OutputIPA) {
+        if let a = ipaAnalysis[ipa.path] {
+            var copy = ipa
+            copy.analysis = a
+            ipaDetail = copy
+            return
+        }
+        ipaAnalyzing.insert(ipa.path)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ipaanalyzer.analyze(path: ipa.path)
+            DispatchQueue.main.async {
+                ipaAnalysis[ipa.path] = result
+                ipaAnalyzing.remove(ipa.path)
+                if let idx = ipas.firstIndex(where: { $0.path == ipa.path }) {
+                    ipas[idx].analysis = result
+                }
+                var copy = ipa
+                copy.analysis = result
+                ipaDetail = copy
+            }
+        }
+    }
+
+    /// 单个删除（滑动菜单用）。同名 .plist / .app 目录一起清。
+    private func deleteIPA(_ ipa: OutputIPA) {
+        let fm = FileManager.default
+        let stem = (ipa.path as NSString).deletingPathExtension
+        var removed = false
+        for p in [ipa.path, stem + ".plist", stem] where fm.fileExists(atPath: p) {
+            do {
+                try fm.removeItem(atPath: p)
+                removed = true
+            } catch {
+                // 属主不对的文件：先改成可写再试一次
+                chmod(p, 0o700)
+                if (try? fm.removeItem(atPath: p)) != nil { removed = true }
+                else { AppDumpmgr.shared.logmsg("(ipa) delete failed \(p): \(error.localizedDescription)") }
+            }
+        }
+        if !removed {
+            errormsg = "删除失败：\(ipa.fileName)"
+        } else {
+            AppDumpmgr.shared.logmsg("(ipa) deleted \(ipa.fileName)")
+            ipaAnalysis.removeValue(forKey: ipa.path)
+            ipas.removeAll { $0.path == ipa.path }
+            selectedipas.remove(ipa.id)
+        }
+        ipaPendingDelete = nil
     }
 
     private func deleteSelectedIPAs() {
@@ -1394,12 +1591,42 @@ struct AppRow: View {
 
 struct IPARow: View {
     let ipa: OutputIPA
+    let analysis: ipaanalysis?
+    let analyzing: Bool
     let editing: Bool
     let selected: Bool
     let onToggle: () -> Void
     let onShare: () -> Void
+    let onAnalyze: () -> Void
+    let onDelete: () -> Void
+
+    @State private var offset: CGFloat = 0
+    @State private var opened: Bool = false   // 是否已经滑开
+
+    /// 单个动作按钮宽度。右滑露出「删除 / 分析」两个，左滑露出「分享」一个。
+    private let actionWidth: CGFloat = 78
+    private var infoWidth: CGFloat { actionWidth * 2 }
 
     var body: some View {
+        // 卡片式列表没有原生 .swipeActions（那是 List 行才有的），所以自己用
+        // DragGesture 实现：左滑只露删除，右滑在左侧露出 分享 / 分析。
+        ZStack {
+            trailingActions
+            leadingActions
+            rowContent
+                .background(AppTheme.cardFill)
+                .offset(x: offset)
+                .gesture(pager)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.86), value: offset)
+        // 编辑模式（多选）下 pager 直接 return，避免和勾选手势打架
+        .transaction { t in if editing { t.animation = nil } }
+    }
+
+    // MARK: - 行内容
+
+    private var rowContent: some View {
         HStack(spacing: 12) {
             if editing {
                 Button(action: onToggle) {
@@ -1414,19 +1641,26 @@ struct IPARow: View {
                 .fill(Color.white.opacity(0.06))
                 .frame(width: 44, height: 44)
                 .overlay(
-                    Image(systemName: ipa.source == .decrypted ? "lock.open.fill" : "square.and.arrow.up.fill")
+                    Image(systemName: iconName)
                         .font(.title3)
-                        .foregroundStyle(ipa.source == .decrypted ? Color.blue : Color.green)
+                        .foregroundStyle(iconColor)
                 )
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(ipa.baseName)
+                Text(analysis?.appName ?? ipa.baseName)
                     .font(.body.weight(.medium))
                     .lineLimit(1)
-                Text("\(ipa.source.rawValue) · \(ipa.date.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(titleLine)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if let status {
+                        Text(status.text)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(status.color)
+                    }
+                }
                 Text(ByteCountFormatter.string(fromByteCount: ipa.size, countStyle: .file))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -1446,9 +1680,276 @@ struct IPARow: View {
             }
         }
         .padding(.vertical, 4)
+        .padding(.horizontal, 4)
         .contentShape(Rectangle())
         .onTapGesture {
-            if editing { onToggle() } else { onShare() }
+            if editing { onToggle() }
+            else if opened { close() }
+            else { onAnalyze() }
+        }
+    }
+
+    private var titleLine: String {
+        if analyzing { return "分析中…" }
+        var parts: [String] = [ipa.source.rawValue]
+        if let a = analysis {
+            if let v = a.version, !v.isEmpty { parts.append("v" + v) }
+            if !a.variant.isEmpty { parts.append(a.variant) }
+        } else {
+            parts.append(ipa.date.formatted(date: .abbreviated, time: .shortened))
+        }
+        if let a = analysis, let bid = a.bundleID, !bid.isEmpty { parts.append(bid) }
+        return parts.joined(separator: " · ")
+    }
+
+    private var iconName: String {
+        guard let a = analysis else {
+            return ipa.source == .decrypted ? "lock.open.fill" : "square.and.arrow.up.fill"
+        }
+        if !a.integrity.isOK { return "exclamationmark.triangle.fill" }
+        if a.encrypted { return "lock.fill" }
+        return a.installable ? "checkmark.seal.fill" : "shippingbox.fill"
+    }
+
+    private var iconColor: Color {
+        guard let a = analysis else { return ipa.source == .decrypted ? .blue : .green }
+        if !a.integrity.isOK { return .orange }
+        if a.encrypted { return .red }
+        return .green
+    }
+
+    private var status: (text: String, color: Color)? {
+        guard let a = analysis else { return analyzing ? ("分析中", .secondary) : nil }
+        if !a.integrity.isOK { return ("结构异常", .orange) }
+        if a.encrypted { return ("未解密", .red) }
+        return a.installable ? ("可安装", .green) : nil
+    }
+
+    // MARK: - 滑动
+
+    private func close() {
+        offset = 0
+        opened = false
+    }
+
+    private var pager: some Gesture {
+        DragGesture(minimumDistance: 12)
+            .onChanged { v in
+                guard !editing else { return }
+                var x = v.translation.width
+                if !opened {
+                    // 没滑开时限制方向上的最大位移
+                    if x < 0 { x = max(x, -actionWidth) }
+                    if x > 0 { x = min(x, infoWidth) }
+                } else if offset < 0 {
+                    x = x - actionWidth
+                    x = min(max(x, -actionWidth), 0)
+                } else {
+                    x = x + infoWidth
+                    x = min(max(x, 0), infoWidth)
+                }
+                offset = x
+            }
+            .onEnded { v in
+                guard !editing else { return }
+                let predicted = v.predictedEndTranslation.width
+                if offset < 0 {
+                    let open = opened ? !(predicted > 40) : (offset < -actionWidth / 2 || predicted < -actionWidth)
+                    offset = open ? -actionWidth : 0
+                    opened = open
+                } else {
+                    let open = opened ? !(predicted < -40) : (offset > infoWidth / 2 || predicted > infoWidth)
+                    offset = open ? infoWidth : 0
+                    opened = open
+                }
+            }
+    }
+
+    /// 左滑（从右往左）露出的分享
+    private var trailingActions: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            Button {
+                close()
+                onShare()
+            } label: {
+                VStack(spacing: 2) {
+                    Image(systemName: "square.and.arrow.up.fill")
+                    Text("分享").font(.caption2)
+                }
+                .frame(width: actionWidth)
+                .frame(maxHeight: .infinity)
+                .foregroundStyle(.white)
+                .background(Color.green)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// 右滑（从左往右）露出的删除 / 分析
+    private var leadingActions: some View {
+        HStack(spacing: 0) {
+            Button {
+                close()
+                onDelete()
+            } label: {
+                VStack(spacing: 2) {
+                    Image(systemName: "trash.fill")
+                    Text("删除").font(.caption2)
+                }
+                .frame(width: actionWidth)
+                .frame(maxHeight: .infinity)
+                .foregroundStyle(.white)
+                .background(Color.red)
+            }
+            .buttonStyle(.plain)
+            Button {
+                close()
+                onAnalyze()
+            } label: {
+                VStack(spacing: 2) {
+                    Image(systemName: "sparkle.magnifyingglass")
+                    Text("分析").font(.caption2)
+                }
+                .frame(width: actionWidth)
+                .frame(maxHeight: .infinity)
+                .foregroundStyle(.white)
+                .background(Color.blue)
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+// MARK: - IPA 分析详情
+
+struct ipaanalysisView: View {
+    let ipa: OutputIPA
+    let onShare: () -> Void
+    let onDelete: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        List {
+            Section {
+                if let a = ipa.analysis {
+                    kv("应用", a.appName ?? "—")
+                    kv("Bundle ID", a.bundleID ?? "—")
+                    kv("版本", a.version ?? "—")
+                    kv("最低系统", a.minimumOS.map { "iOS \($0)" } ?? "—")
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("正在分析…").foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("概览")
+            }
+
+            if let a = ipa.analysis {
+                Section {
+                    HStack {
+                        Text("结构完整性")
+                        Spacer()
+                        Text(a.integrity.text)
+                            .foregroundStyle(a.integrity.isOK ? Color.secondary : Color.orange)
+                    }
+                    HStack {
+                        Text("签名")
+                        Spacer()
+                        Text(a.signed ? "有 _CodeSignature" : "缺失")
+                            .foregroundStyle(a.signed ? Color.secondary : Color.orange)
+                    }
+                    HStack {
+                        Text("加密")
+                        Spacer()
+                        Text(a.encrypted ? "仍有密文（不能直接用）"
+                             : (a.binaries.isEmpty ? "未检测" : "已解密"))
+                            .foregroundStyle(a.encrypted ? Color.red : Color.green)
+                    }
+                    kv("架构", a.archs.isEmpty ? "—" : a.archs.joined(separator: ", "))
+                    kv("条目", "\(a.entryCount) 个，解压后 \(ByteCountFormatter.string(fromByteCount: Int64(a.uncompressedTotal), countStyle: .file))")
+                    if let e = a.extensionSummary { kv("扩展", e) }
+                    if a.hasWatchApp { kv("Watch", "包含") }
+                } header: {
+                    Text("分析结论")
+                }
+
+                if !a.binaries.isEmpty {
+                    Section {
+                        ForEach(a.binaries) { b in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(b.name)
+                                    .font(.subheadline.weight(.medium))
+                                Text("\(b.archs.joined(separator: ", ")) · \(ByteCountFormatter.string(fromByteCount: Int64(b.size), countStyle: .file)) · \(b.encrypted ? "cryptid≠0" : "明文")")
+                                    .font(.caption)
+                                    .foregroundStyle(b.encrypted ? Color.red : Color.green)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    } header: {
+                        Text("包内二进制")
+                    } footer: {
+                        Text("cryptid≠0 表示该二进制仍带非零的 LC_ENCRYPTION_INFO，安装后会闪退，需要重新砸壳。")
+                    }
+                }
+
+                if !a.notes.isEmpty {
+                    Section("提示") {
+                        ForEach(a.notes, id: \.self) { n in
+                            Text(n).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
+            Section {
+                kv("文件", ipa.fileName)
+                kv("大小", ByteCountFormatter.string(fromByteCount: ipa.size, countStyle: .file))
+                kv("修改", ipa.date.formatted(date: .abbreviated, time: .shortened))
+                kv("来源", ipa.source.rawValue)
+            } header: {
+                Text("文件")
+            } footer: {
+                Text((ipa.path as NSString).deletingLastPathComponent)
+                    .font(.caption2)
+                    .textSelection(.enabled)
+            }
+
+            Section {
+                Button {
+                    onShare()
+                } label: {
+                    Label("分享 IPA + 分析报告", systemImage: "square.and.arrow.up")
+                }
+                Button(role: .destructive) {
+                    dismiss()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onDelete() }
+                } label: {
+                    Label("删除", systemImage: "trash")
+                }
+            }
+        }
+        .navigationTitle("IPA 分析")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("完成") { dismiss() }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func kv(_ k: String, _ v: String) -> some View {
+        HStack(alignment: .top) {
+            Text(k).foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(v)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
         }
     }
 }
